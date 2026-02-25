@@ -253,6 +253,12 @@ def split_and_save_layers(
     if sequential_shard_processing and not single_file_model:
         layer_to_shards = {}
         shard_to_layers = {}
+        shards_to_total_layers_count = {}
+        for k, v in index.items():
+            if v not in shards_to_total_layers_count:
+                shards_to_total_layers_count[v] = set()
+            shards_to_total_layers_count[v].add(k)
+            
         for layer in layers:
             shards_for_layer = set()
             for k, v in index.items():
@@ -299,8 +305,10 @@ def split_and_save_layers(
                 processed_shards.add(shard_file)
                 if delete_original:
                     if shard_file not in shard_to_layers or len(shard_to_layers[shard_file]) == 0:
-                        logger.info("Deleted shard %s/%s (no layers): %s", shard_idx, len(sorted_shards), to_load)
+                        logger.info("Deleted shard %s/%s (no target layers mapping): %s", shard_idx, len(sorted_shards), to_load)
                         remove_real_and_linked_file(to_load)
+                        if shard_file in shard_to_layers:
+                            del shard_to_layers[shard_file]
 
                 completed_layers = []
                 for layer, tensors in partial_layers.items():
@@ -323,8 +331,9 @@ def split_and_save_layers(
                                 if len(shard_to_layers[s_file]) == 0:
                                     to_delete = checkpoint_path / s_file
                                     if os.path.exists(to_delete):
-                                        logger.info("Deleted shard correctly after processing: %s", to_delete)
+                                        logger.info("Deleted shard %s correctly after processing its layers: %s", s_file, to_delete)
                                         remove_real_and_linked_file(to_delete)
+                                    del shard_to_layers[s_file]
 
                 clean_memory()
 
@@ -334,7 +343,29 @@ def split_and_save_layers(
             if not marker_exists:
                 ModelPersister.get_model_persister().persist_model(layer_state_dict, layer, saving_path)
             del layer_state_dict
+            
+            if delete_original:
+                for s_file in layer_to_shards.get(layer, []):
+                    if s_file in shard_to_layers and layer in shard_to_layers[s_file]:
+                        shard_to_layers[s_file].remove(layer)
+                        if len(shard_to_layers[s_file]) == 0:
+                            to_delete = checkpoint_path / s_file
+                            if os.path.exists(to_delete):
+                                logger.info("Deleted shard %s correctly after processing remaining layers: %s", s_file, to_delete)
+                                remove_real_and_linked_file(to_delete)
+                            del shard_to_layers[s_file]
+                
         partial_layers.clear()
+        
+        # Fallback to delete any un-deleted shards
+        if delete_original:
+            for s_file in list(shard_to_layers.keys()):
+                to_delete = checkpoint_path / s_file
+                if os.path.exists(to_delete):
+                    logger.info("Deleted remaining shard %s: %s", s_file, to_delete)
+                    remove_real_and_linked_file(to_delete)
+                del shard_to_layers[s_file]
+                
         clean_memory()
 
     else:
