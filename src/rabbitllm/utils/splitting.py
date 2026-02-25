@@ -293,7 +293,7 @@ def split_and_save_layers(
 
                 del shard_state_dict
                 if delete_original:
-                    logger.debug("deleting original shard: %s", to_load)
+                    logger.info("Deleted shard %s/%s: %s", shard_idx, len(sorted_shards), to_load)
                     remove_real_and_linked_file(to_load)
 
                 processed_shards.add(shard_file)
