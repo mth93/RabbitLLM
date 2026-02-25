@@ -325,80 +325,80 @@ def split_and_save_layers(
 
     else:
         for layer in tqdm(layers):
-        if not single_file_model:
-            shards = [
-                int(v.split("-")[1])
-                for k, v in index.items()
-                if k.startswith(layer) and "-" in v and len(v.split("-")) > 1
-            ]
-            if len(shards) > 0:
-                if max(shards) > shard:
-                    if delete_original and shard != 0:
+            if not single_file_model:
+                shards = [
+                    int(v.split("-")[1])
+                    for k, v in index.items()
+                    if k.startswith(layer) and "-" in v and len(v.split("-")) > 1
+                ]
+                if len(shards) > 0:
+                    if max(shards) > shard:
+                        if delete_original and shard != 0:
+                            if not safetensors_format:
+                                to_delete = (
+                                    checkpoint_path
+                                    / f"pytorch_model-000{shard:02d}-of-000{n_shards:02d}.bin"
+                                )
+                            else:
+                                to_delete = (
+                                    checkpoint_path
+                                    / f"model-000{shard:02d}-of-000{n_shards:02d}.safetensors"
+                                )
+
+                            logger.debug("deleting original file: %s", to_delete)
+                            remove_real_and_linked_file(to_delete)
+                        shard += 1
+                        logger.info("Loading shard %s/%s", shard, n_shards)
+
                         if not safetensors_format:
-                            to_delete = (
+                            to_load = (
                                 checkpoint_path
                                 / f"pytorch_model-000{shard:02d}-of-000{n_shards:02d}.bin"
                             )
                         else:
-                            to_delete = (
+                            to_load = (
                                 checkpoint_path
                                 / f"model-000{shard:02d}-of-000{n_shards:02d}.safetensors"
                             )
 
-                        logger.debug("deleting original file: %s", to_delete)
-                        remove_real_and_linked_file(to_delete)
-                    shard += 1
-                    logger.info("Loading shard %s/%s", shard, n_shards)
+                        if not os.path.exists(to_load):
+                            assert repo_id is not None
+                            huggingface_hub.snapshot_download(
+                                repo_id, allow_patterns=os.path.basename(to_load), token=_token
+                            )
 
-                    if not safetensors_format:
-                        to_load = (
-                            checkpoint_path
-                            / f"pytorch_model-000{shard:02d}-of-000{n_shards:02d}.bin"
-                        )
-                    else:
-                        to_load = (
-                            checkpoint_path
-                            / f"model-000{shard:02d}-of-000{n_shards:02d}.safetensors"
-                        )
+                        if not safetensors_format:
+                            state_dict.update(torch.load(to_load, map_location="cpu"))
+                        else:
+                            state_dict.update(load_file(to_load, device="cpu"))
 
+                else:
+                    shards = [v for k, v in index.items() if k.startswith(layer)]
+                    single_modelfile = shards[0]
+                    to_load = checkpoint_path / single_modelfile
                     if not os.path.exists(to_load):
                         assert repo_id is not None
                         huggingface_hub.snapshot_download(
                             repo_id, allow_patterns=os.path.basename(to_load), token=_token
                         )
-
                     if not safetensors_format:
                         state_dict.update(torch.load(to_load, map_location="cpu"))
                     else:
                         state_dict.update(load_file(to_load, device="cpu"))
 
-            else:
-                shards = [v for k, v in index.items() if k.startswith(layer)]
-                single_modelfile = shards[0]
-                to_load = checkpoint_path / single_modelfile
-                if not os.path.exists(to_load):
-                    assert repo_id is not None
-                    huggingface_hub.snapshot_download(
-                        repo_id, allow_patterns=os.path.basename(to_load), token=_token
-                    )
-                if not safetensors_format:
-                    state_dict.update(torch.load(to_load, map_location="cpu"))
-                else:
-                    state_dict.update(load_file(to_load, device="cpu"))
+            layer_state_dict = dict([(k, v) for k, v in state_dict.items() if k.startswith(layer)])
 
-        layer_state_dict = dict([(k, v) for k, v in state_dict.items() if k.startswith(layer)])
+            layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
 
-        layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
+            marker_exists = ModelPersister.get_model_persister().model_persist_exist(layer, saving_path)
+            if not marker_exists:
+                ModelPersister.get_model_persister().persist_model(layer_state_dict, layer, saving_path)
 
-        marker_exists = ModelPersister.get_model_persister().model_persist_exist(layer, saving_path)
-        if not marker_exists:
-            ModelPersister.get_model_persister().persist_model(layer_state_dict, layer, saving_path)
-
-        for k in layer_state_dict.keys():
-            if k in state_dict:
-                del state_dict[k]
-        del layer_state_dict
-        clean_memory()
+            for k in layer_state_dict.keys():
+                if k in state_dict:
+                    del state_dict[k]
+            del layer_state_dict
+            clean_memory()
 
     if delete_original and single_modelfile is not None:
         to_delete = checkpoint_path / single_modelfile
