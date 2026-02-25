@@ -336,9 +336,10 @@ def split_and_save_layers(
                     pbar.update(1)
 
                     if delete_original:
+                        # 1. Remove exactly what was popped
                         for k_consumed in layer_keys_consumed:
-                            s_file = index[k_consumed]
-                            if s_file in shards_to_total_layers_count and k_consumed in shards_to_total_layers_count[s_file]:
+                            s_file = index.get(k_consumed)
+                            if s_file and s_file in shards_to_total_layers_count and k_consumed in shards_to_total_layers_count[s_file]:
                                 shards_to_total_layers_count[s_file].remove(k_consumed)
                                 if len(shards_to_total_layers_count[s_file]) == 0:
                                     to_delete = checkpoint_path / s_file
@@ -346,6 +347,21 @@ def split_and_save_layers(
                                         logger.info("Deleted shard correctly after processing its layers: %s", to_delete)
                                         remove_real_and_linked_file(to_delete)
                                     del shards_to_total_layers_count[s_file]
+                                    
+                        # 2. Strict Fallback: Remove any tracking keys that were logically parsed for this exact layer prefix
+                        # Using `.startswith` is safe ONLY IF we ensure it's a strict boundary (e.g. ending in '.'). 
+                        # The `layer` string provided by the user config already generally ends in '.' or is a complete match.
+                        for s_file in list(shards_to_total_layers_count.keys()):
+                            keys_to_remove = [k for k in shards_to_total_layers_count[s_file] if k.startswith(layer)]
+                            for k in keys_to_remove:
+                                shards_to_total_layers_count[s_file].remove(k)
+                            
+                            if len(shards_to_total_layers_count[s_file]) == 0:
+                                to_delete = checkpoint_path / s_file
+                                if os.path.exists(to_delete):
+                                    logger.info("Deleted shard correctly after strict fallback processing: %s", to_delete)
+                                    remove_real_and_linked_file(to_delete)
+                                del shards_to_total_layers_count[s_file]
 
                 clean_memory()
 
@@ -362,8 +378,8 @@ def split_and_save_layers(
             
             if delete_original:
                 for k_consumed in layer_keys_consumed:
-                    s_file = index[k_consumed]
-                    if s_file in shards_to_total_layers_count and k_consumed in shards_to_total_layers_count[s_file]:
+                    s_file = index.get(k_consumed)
+                    if s_file and s_file in shards_to_total_layers_count and k_consumed in shards_to_total_layers_count[s_file]:
                         shards_to_total_layers_count[s_file].remove(k_consumed)
                         if len(shards_to_total_layers_count[s_file]) == 0:
                             to_delete = checkpoint_path / s_file
@@ -371,8 +387,27 @@ def split_and_save_layers(
                                 logger.info("Deleted shard correctly after processing remaining layers: %s", to_delete)
                                 remove_real_and_linked_file(to_delete)
                             del shards_to_total_layers_count[s_file]
+                            
+                # Fallback sweep for any remaining matching keys
+                for s_file in list(shards_to_total_layers_count.keys()):
+                    keys_to_remove = [k for k in shards_to_total_layers_count[s_file] if k.startswith(layer)]
+                    for k in keys_to_remove:
+                        shards_to_total_layers_count[s_file].remove(k)
+                    
+                    if len(shards_to_total_layers_count[s_file]) == 0:
+                        to_delete = checkpoint_path / s_file
+                        if os.path.exists(to_delete):
+                            logger.info("Deleted shard correctly after trailing strict fallback: %s", to_delete)
+                            remove_real_and_linked_file(to_delete)
+                        del shards_to_total_layers_count[s_file]
                 
         partial_layers.clear()
+        
+        # DEBUG: Let's see what is left behind preventing deletion
+        if delete_original:
+            for s_file, remaining_keys in list(shards_to_total_layers_count.items()):
+                if len(remaining_keys) > 0:
+                    logger.warning(f"DEBUG: Shard {s_file} still has {len(remaining_keys)} keys preventing its deletion! Sample: {list(remaining_keys)[:5]}")
         
         if delete_original:
             for s_file in list(shards_to_total_layers_count.keys()):
