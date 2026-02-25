@@ -125,6 +125,7 @@ def split_and_save_layers(
     repo_id: Optional[str] = None,
     token: Optional[str] = None,
     hf_token: Optional[str] = None,
+    sequential_shard_processing: bool = False,
 ) -> str:
     """Split a sharded checkpoint into per-layer safetensors and save to disk.
 
@@ -249,7 +250,81 @@ def split_and_save_layers(
         logger.info("Loading single-file model: %s", single_modelfile)
         state_dict = load_file(single_file_path, device="cpu")
 
-    for layer in tqdm(layers):
+    if sequential_shard_processing and not single_file_model:
+        layer_to_shards = {}
+        for layer in layers:
+            shards_for_layer = set()
+            for k, v in index.items():
+                if k.startswith(layer):
+                    shards_for_layer.add(v)
+            if shards_for_layer:
+                layer_to_shards[layer] = shards_for_layer
+
+        sorted_shards = sorted(list(set(index.values())))
+        processed_shards = set()
+        partial_layers = {}
+        total_layers = len(layer_to_shards)
+
+        with tqdm(total=total_layers, desc="Assembling layers sequentially") as pbar:
+            for shard_idx, shard_file in enumerate(sorted_shards, 1):
+                logger.info("Loading shard %s/%s: %s", shard_idx, len(sorted_shards), shard_file)
+                to_load = checkpoint_path / shard_file
+                if not os.path.exists(to_load):
+                    assert repo_id is not None
+                    huggingface_hub.snapshot_download(
+                        repo_id, allow_patterns=os.path.basename(to_load), token=_token
+                    )
+
+                if not safetensors_format:
+                    shard_state_dict = torch.load(to_load, map_location="cpu")
+                else:
+                    shard_state_dict = load_file(to_load, device="cpu")
+
+                for k, v in shard_state_dict.items():
+                    matched_layer = None
+                    for layer in layers:
+                        if k.startswith(layer):
+                            matched_layer = layer
+                            break
+                    if matched_layer:
+                        if matched_layer not in partial_layers:
+                            partial_layers[matched_layer] = {}
+                        partial_layers[matched_layer][k] = v
+
+                del shard_state_dict
+                if delete_original:
+                    logger.debug("deleting original shard: %s", to_load)
+                    remove_real_and_linked_file(to_load)
+
+                processed_shards.add(shard_file)
+
+                completed_layers = []
+                for layer, tensors in partial_layers.items():
+                    if layer_to_shards[layer].issubset(processed_shards):
+                        completed_layers.append(layer)
+
+                for layer in completed_layers:
+                    layer_state_dict = partial_layers.pop(layer)
+                    layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
+                    marker_exists = ModelPersister.get_model_persister().model_persist_exist(layer, saving_path)
+                    if not marker_exists:
+                        ModelPersister.get_model_persister().persist_model(layer_state_dict, layer, saving_path)
+                    del layer_state_dict
+                    pbar.update(1)
+
+                clean_memory()
+
+        for layer, layer_state_dict in list(partial_layers.items()):
+            layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
+            marker_exists = ModelPersister.get_model_persister().model_persist_exist(layer, saving_path)
+            if not marker_exists:
+                ModelPersister.get_model_persister().persist_model(layer_state_dict, layer, saving_path)
+            del layer_state_dict
+        partial_layers.clear()
+        clean_memory()
+
+    else:
+        for layer in tqdm(layers):
         if not single_file_model:
             shards = [
                 int(v.split("-")[1])
@@ -341,6 +416,7 @@ def find_or_create_local_splitted_path(
     token: Optional[str] = None,
     hf_token: Optional[str] = None,
     delete_original: bool = False,
+    sequential_shard_processing: bool = False,
 ) -> Tuple[Path, str]:
     """Resolve local checkpoint path and ensure the model is split into per-layer files.
 
@@ -374,6 +450,7 @@ def find_or_create_local_splitted_path(
                 compression=compression,
                 layer_names=layer_names,
                 delete_original=delete_original,
+                sequential_shard_processing=sequential_shard_processing,
             )
         else:
             logger.warning(
@@ -402,4 +479,5 @@ def find_or_create_local_splitted_path(
         delete_original=delete_original,
         repo_id=model_local_path_or_repo_id,
         token=_token,
+        sequential_shard_processing=sequential_shard_processing,
     )

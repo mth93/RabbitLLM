@@ -59,3 +59,101 @@ def test_remove_real_and_linked_file_removes_file(tmp_path):
     assert path.exists()
     remove_real_and_linked_file(path)
     assert not path.exists()
+
+
+def test_sequential_shard_processing_logic(tmp_path):
+    import json
+    from unittest.mock import patch
+    from rabbitllm.utils.splitting import split_and_save_layers
+
+    index_data = {
+        "weight_map": {
+            "model.embed_tokens.weight": "pytorch_model-00001-of-00002.bin",
+            "model.layers.0.self_attn.q_proj.weight": "pytorch_model-00001-of-00002.bin",
+            "model.layers.0.self_attn.k_proj.weight": "pytorch_model-00002-of-00002.bin",
+            "model.norm.weight": "pytorch_model-00002-of-00002.bin",
+            "lm_head.weight": "pytorch_model-00002-of-00002.bin"
+        }
+    }
+    
+    with open(tmp_path / "pytorch_model.bin.index.json", "w") as f:
+        json.dump(index_data, f)
+        
+    shard1 = {
+        "model.embed_tokens.weight": torch.randn(2, 2),
+        "model.layers.0.self_attn.q_proj.weight": torch.randn(2, 2)
+    }
+    torch.save(shard1, tmp_path / "pytorch_model-00001-of-00002.bin")
+    
+    shard2 = {
+        "model.layers.0.self_attn.k_proj.weight": torch.randn(2, 2),
+        "model.norm.weight": torch.randn(2, 2),
+        "lm_head.weight": torch.randn(2, 2)
+    }
+    torch.save(shard2, tmp_path / "pytorch_model-00002-of-00002.bin")
+    
+    layer_names = {
+        "embed": "model.embed_tokens",
+        "layer_prefix": "model.layers",
+        "norm": "model.norm",
+        "lm_head": "lm_head"
+    }
+
+    mock_persister = MagicMock()
+    mock_persister_instance = MagicMock()
+    mock_persister_instance.model_persist_exist.return_value = False
+    mock_persister.get_model_persister.return_value = mock_persister_instance
+
+    with patch("rabbitllm.utils.splitting.ModelPersister", mock_persister):
+        split_and_save_layers(
+            checkpoint_path=tmp_path,
+            layer_shards_saving_path=tmp_path,
+            layer_names=layer_names,
+            delete_original=False,
+            sequential_shard_processing=True,
+        )
+        
+    calls = mock_persister_instance.persist_model.call_args_list
+    saved_layers = [call.args[1] for call in calls]
+    
+    assert "model.embed_tokens." in saved_layers
+    assert "model.layers.0." in saved_layers
+    assert "model.norm." in saved_layers
+    assert "lm_head." in saved_layers
+    assert (tmp_path / "pytorch_model-00001-of-00002.bin").exists()
+
+
+def test_sequential_shard_processing_delete_original(tmp_path):
+    import json
+    from unittest.mock import patch
+    from rabbitllm.utils.splitting import split_and_save_layers
+
+    index_data = {
+        "weight_map": {
+            "model.embed_tokens.weight": "pytorch_model-00001-of-00002.bin",
+        }
+    }
+    
+    with open(tmp_path / "pytorch_model.bin.index.json", "w") as f:
+        json.dump(index_data, f)
+        
+    shard1 = {
+        "model.embed_tokens.weight": torch.randn(2, 2),
+    }
+    torch.save(shard1, tmp_path / "pytorch_model-00001-of-00002.bin")
+    
+    mock_persister = MagicMock()
+    mock_persister_instance = MagicMock()
+    mock_persister_instance.model_persist_exist.return_value = False
+    mock_persister.get_model_persister.return_value = mock_persister_instance
+
+    with patch("rabbitllm.utils.splitting.ModelPersister", mock_persister):
+        split_and_save_layers(
+            checkpoint_path=tmp_path,
+            layer_shards_saving_path=tmp_path,
+            layer_names={"embed": "model.embed_tokens", "layer_prefix": "model.layers", "norm": "model.norm", "lm_head": "lm_head"},
+            delete_original=True,
+            sequential_shard_processing=True,
+        )
+        
+    assert not (tmp_path / "pytorch_model-00001-of-00002.bin").exists()
