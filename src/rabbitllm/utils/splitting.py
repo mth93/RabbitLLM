@@ -252,7 +252,6 @@ def split_and_save_layers(
 
     if sequential_shard_processing and not single_file_model:
         layer_to_shards = {}
-        shard_to_layers = {}
         shards_to_total_layers_count = {}
         for k, v in index.items():
             if v not in shards_to_total_layers_count:
@@ -264,9 +263,6 @@ def split_and_save_layers(
             for k, v in index.items():
                 if k.startswith(layer):
                     shards_for_layer.add(v)
-                    if v not in shard_to_layers:
-                        shard_to_layers[v] = set()
-                    shard_to_layers[v].add(layer)
             if shards_for_layer:
                 layer_to_shards[layer] = shards_for_layer
 
@@ -302,13 +298,9 @@ def split_and_save_layers(
                         partial_layers[matched_layer][k] = v
 
                 del shard_state_dict
+                # We process incoming shards and delete them when NO MORE layers of that shard are expected to be processed.
+                # However, since `partial_layers` hasn't compressed yet, we cannot delete here! We just add to processed.
                 processed_shards.add(shard_file)
-                if delete_original:
-                    if shard_file not in shard_to_layers or len(shard_to_layers[shard_file]) == 0:
-                        logger.info("Deleted shard %s/%s (no target layers mapping): %s", shard_idx, len(sorted_shards), to_load)
-                        remove_real_and_linked_file(to_load)
-                        if shard_file in shard_to_layers:
-                            del shard_to_layers[shard_file]
 
                 completed_layers = []
                 for layer, tensors in partial_layers.items():
@@ -325,15 +317,19 @@ def split_and_save_layers(
                     pbar.update(1)
 
                     if delete_original:
-                        for s_file in layer_to_shards[layer]:
-                            if s_file in shard_to_layers and layer in shard_to_layers[s_file]:
-                                shard_to_layers[s_file].remove(layer)
-                                if len(shard_to_layers[s_file]) == 0:
+                        # Which original k did this layer consume? 
+                        # We just subtract any k starting with this layer from all shards that own them.
+                        layer_keys_consumed = [k for k in index.keys() if k.startswith(layer)]
+                        for k_consumed in layer_keys_consumed:
+                            s_file = index[k_consumed]
+                            if s_file in shards_to_total_layers_count and k_consumed in shards_to_total_layers_count[s_file]:
+                                shards_to_total_layers_count[s_file].remove(k_consumed)
+                                if len(shards_to_total_layers_count[s_file]) == 0:
                                     to_delete = checkpoint_path / s_file
                                     if os.path.exists(to_delete):
-                                        logger.info("Deleted shard %s correctly after processing its layers: %s", s_file, to_delete)
+                                        logger.info("Deleted shard correctly after processing its layers: %s", to_delete)
                                         remove_real_and_linked_file(to_delete)
-                                    del shard_to_layers[s_file]
+                                    del shards_to_total_layers_count[s_file]
 
                 clean_memory()
 
@@ -345,26 +341,27 @@ def split_and_save_layers(
             del layer_state_dict
             
             if delete_original:
-                for s_file in layer_to_shards.get(layer, []):
-                    if s_file in shard_to_layers and layer in shard_to_layers[s_file]:
-                        shard_to_layers[s_file].remove(layer)
-                        if len(shard_to_layers[s_file]) == 0:
+                layer_keys_consumed = [k for k in index.keys() if k.startswith(layer)]
+                for k_consumed in layer_keys_consumed:
+                    s_file = index[k_consumed]
+                    if s_file in shards_to_total_layers_count and k_consumed in shards_to_total_layers_count[s_file]:
+                        shards_to_total_layers_count[s_file].remove(k_consumed)
+                        if len(shards_to_total_layers_count[s_file]) == 0:
                             to_delete = checkpoint_path / s_file
                             if os.path.exists(to_delete):
-                                logger.info("Deleted shard %s correctly after processing remaining layers: %s", s_file, to_delete)
+                                logger.info("Deleted shard correctly after processing remaining layers: %s", to_delete)
                                 remove_real_and_linked_file(to_delete)
-                            del shard_to_layers[s_file]
+                            del shards_to_total_layers_count[s_file]
                 
         partial_layers.clear()
         
-        # Fallback to delete any un-deleted shards
         if delete_original:
-            for s_file in list(shard_to_layers.keys()):
+            for s_file in list(shards_to_total_layers_count.keys()):
                 to_delete = checkpoint_path / s_file
                 if os.path.exists(to_delete):
-                    logger.info("Deleted remaining shard %s: %s", s_file, to_delete)
+                    logger.info("Deleted remaining shard %s", to_delete)
                     remove_real_and_linked_file(to_delete)
-                del shard_to_layers[s_file]
+                del shards_to_total_layers_count[s_file]
                 
         clean_memory()
 
