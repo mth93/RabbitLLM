@@ -258,13 +258,16 @@ def split_and_save_layers(
                 shards_to_total_layers_count[v] = set()
             shards_to_total_layers_count[v].add(k)
             
-        for layer in layers:
-            shards_for_layer = set()
-            for k, v in index.items():
+        for k, v in index.items():
+            matched_layer = None
+            for layer in layers:
                 if k.startswith(layer):
-                    shards_for_layer.add(v)
-            if shards_for_layer:
-                layer_to_shards[layer] = shards_for_layer
+                    matched_layer = layer
+                    break
+            if matched_layer:
+                if matched_layer not in layer_to_shards:
+                    layer_to_shards[matched_layer] = set()
+                layer_to_shards[matched_layer].add(v)
 
         sorted_shards = sorted(list(set(index.values())))
         processed_shards = set()
