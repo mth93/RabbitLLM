@@ -252,12 +252,8 @@ def split_and_save_layers(
 
     if sequential_shard_processing and not single_file_model:
         layer_to_shards = {}
-        shards_to_total_layers_count = {}
-        for k, v in index.items():
-            if v not in shards_to_total_layers_count:
-                shards_to_total_layers_count[v] = set()
-            shards_to_total_layers_count[v].add(k)
-            
+        shard_to_layers = {}
+        
         for k, v in index.items():
             matched_layer = None
             for layer in layers:
@@ -268,6 +264,10 @@ def split_and_save_layers(
                 if matched_layer not in layer_to_shards:
                     layer_to_shards[matched_layer] = set()
                 layer_to_shards[matched_layer].add(v)
+                
+                if v not in shard_to_layers:
+                    shard_to_layers[v] = set()
+                shard_to_layers[v].add(matched_layer)
 
         sorted_shards = sorted(list(set(index.values())))
         processed_shards = set()
@@ -299,20 +299,18 @@ def split_and_save_layers(
                         if matched_layer not in partial_layers:
                             partial_layers[matched_layer] = {}
                         partial_layers[matched_layer][k] = v
-                    else:
-                        # If a key in the shard doesn't match any target layer, it's discarded.
-                        # We must decrement its count so the shard can still reach 0 and be deleted.
-                        if delete_original and shard_file in shards_to_total_layers_count:
-                            if k in shards_to_total_layers_count[shard_file]:
-                                shards_to_total_layers_count[shard_file].remove(k)
-                                if len(shards_to_total_layers_count[shard_file]) == 0:
-                                    to_delete = checkpoint_path / shard_file
-                                    if os.path.exists(to_delete):
-                                        logger.info("Deleted shard correctly after parsing discarded layers: %s", to_delete)
-                                        remove_real_and_linked_file(to_delete)
-                                    del shards_to_total_layers_count[shard_file]
 
                 del shard_state_dict
+                
+                # Check if this shard had NO matched layers whatsoever (meaning all its keys were discarded)
+                if delete_original and (shard_file not in shard_to_layers or len(shard_to_layers[shard_file]) == 0):
+                    to_delete = checkpoint_path / shard_file
+                    if os.path.exists(to_delete):
+                        logger.info("Deleted shard correctly (no target layers): %s", to_delete)
+                        remove_real_and_linked_file(to_delete)
+                    if shard_file in shard_to_layers:
+                        del shard_to_layers[shard_file]
+                
                 # We process incoming shards and delete them when NO MORE layers of that shard are expected to be processed.
                 # However, since `partial_layers` hasn't compressed yet, we cannot delete here! We just add to processed.
                 processed_shards.add(shard_file)
@@ -325,9 +323,6 @@ def split_and_save_layers(
                 for layer in completed_layers:
                     layer_state_dict = partial_layers.pop(layer)
                     
-                    # Store exact keys that belong to this mapped layer so we subtract them accurately
-                    layer_keys_consumed = list(layer_state_dict.keys())
-                    
                     layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
                     marker_exists = ModelPersister.get_model_persister().model_persist_exist(layer, saving_path)
                     if not marker_exists:
@@ -336,39 +331,19 @@ def split_and_save_layers(
                     pbar.update(1)
 
                     if delete_original:
-                        # 1. Remove exactly what was popped
-                        for k_consumed in layer_keys_consumed:
-                            s_file = index.get(k_consumed)
-                            if s_file and s_file in shards_to_total_layers_count and k_consumed in shards_to_total_layers_count[s_file]:
-                                shards_to_total_layers_count[s_file].remove(k_consumed)
-                                if len(shards_to_total_layers_count[s_file]) == 0:
+                        for s_file in layer_to_shards.get(layer, []):
+                            if s_file in shard_to_layers and layer in shard_to_layers[s_file]:
+                                shard_to_layers[s_file].remove(layer)
+                                if len(shard_to_layers[s_file]) == 0:
                                     to_delete = checkpoint_path / s_file
                                     if os.path.exists(to_delete):
                                         logger.info("Deleted shard correctly after processing its layers: %s", to_delete)
                                         remove_real_and_linked_file(to_delete)
-                                    del shards_to_total_layers_count[s_file]
-                                    
-                        # 2. Strict Fallback: Remove any tracking keys that were logically parsed for this exact layer prefix
-                        # Using `.startswith` is safe ONLY IF we ensure it's a strict boundary (e.g. ending in '.'). 
-                        # The `layer` string provided by the user config already generally ends in '.' or is a complete match.
-                        for s_file in list(shards_to_total_layers_count.keys()):
-                            keys_to_remove = [k for k in shards_to_total_layers_count[s_file] if k.startswith(layer)]
-                            for k in keys_to_remove:
-                                shards_to_total_layers_count[s_file].remove(k)
-                            
-                            if len(shards_to_total_layers_count[s_file]) == 0:
-                                to_delete = checkpoint_path / s_file
-                                if os.path.exists(to_delete):
-                                    logger.info("Deleted shard correctly after strict fallback processing: %s", to_delete)
-                                    remove_real_and_linked_file(to_delete)
-                                del shards_to_total_layers_count[s_file]
+                                    del shard_to_layers[s_file]
 
                 clean_memory()
 
         for layer, layer_state_dict in list(partial_layers.items()):
-            
-            # Store exact keys that belong to this mapped layer so we subtract them accurately
-            layer_keys_consumed = list(layer_state_dict.keys())
             
             layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
             marker_exists = ModelPersister.get_model_persister().model_persist_exist(layer, saving_path)
@@ -377,45 +352,31 @@ def split_and_save_layers(
             del layer_state_dict
             
             if delete_original:
-                for k_consumed in layer_keys_consumed:
-                    s_file = index.get(k_consumed)
-                    if s_file and s_file in shards_to_total_layers_count and k_consumed in shards_to_total_layers_count[s_file]:
-                        shards_to_total_layers_count[s_file].remove(k_consumed)
-                        if len(shards_to_total_layers_count[s_file]) == 0:
+                for s_file in layer_to_shards.get(layer, []):
+                    if s_file in shard_to_layers and layer in shard_to_layers[s_file]:
+                        shard_to_layers[s_file].remove(layer)
+                        if len(shard_to_layers[s_file]) == 0:
                             to_delete = checkpoint_path / s_file
                             if os.path.exists(to_delete):
                                 logger.info("Deleted shard correctly after processing remaining layers: %s", to_delete)
                                 remove_real_and_linked_file(to_delete)
-                            del shards_to_total_layers_count[s_file]
-                            
-                # Fallback sweep for any remaining matching keys
-                for s_file in list(shards_to_total_layers_count.keys()):
-                    keys_to_remove = [k for k in shards_to_total_layers_count[s_file] if k.startswith(layer)]
-                    for k in keys_to_remove:
-                        shards_to_total_layers_count[s_file].remove(k)
-                    
-                    if len(shards_to_total_layers_count[s_file]) == 0:
-                        to_delete = checkpoint_path / s_file
-                        if os.path.exists(to_delete):
-                            logger.info("Deleted shard correctly after trailing strict fallback: %s", to_delete)
-                            remove_real_and_linked_file(to_delete)
-                        del shards_to_total_layers_count[s_file]
+                            del shard_to_layers[s_file]
                 
         partial_layers.clear()
         
         # DEBUG: Let's see what is left behind preventing deletion
         if delete_original:
-            for s_file, remaining_keys in list(shards_to_total_layers_count.items()):
-                if len(remaining_keys) > 0:
-                    logger.warning(f"DEBUG: Shard {s_file} still has {len(remaining_keys)} keys preventing its deletion! Sample: {list(remaining_keys)[:5]}")
+            for s_file, remaining_layers in list(shard_to_layers.items()):
+                if len(remaining_layers) > 0:
+                    logger.warning(f"DEBUG: Shard {s_file} still has {len(remaining_layers)} layers preventing its deletion! Sample: {list(remaining_layers)}")
         
         if delete_original:
-            for s_file in list(shards_to_total_layers_count.keys()):
+            for s_file in list(shard_to_layers.keys()):
                 to_delete = checkpoint_path / s_file
                 if os.path.exists(to_delete):
-                    logger.info("Deleted remaining shard %s", to_delete)
+                    logger.info("Deleted remaining shard automatically at end: %s", to_delete)
                     remove_real_and_linked_file(to_delete)
-                del shards_to_total_layers_count[s_file]
+                del shard_to_layers[s_file]
                 
         clean_memory()
 
