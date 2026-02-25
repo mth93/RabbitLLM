@@ -296,6 +296,18 @@ def split_and_save_layers(
                         if matched_layer not in partial_layers:
                             partial_layers[matched_layer] = {}
                         partial_layers[matched_layer][k] = v
+                    else:
+                        # If a key in the shard doesn't match any target layer, it's discarded.
+                        # We must decrement its count so the shard can still reach 0 and be deleted.
+                        if delete_original and shard_file in shards_to_total_layers_count:
+                            if k in shards_to_total_layers_count[shard_file]:
+                                shards_to_total_layers_count[shard_file].remove(k)
+                                if len(shards_to_total_layers_count[shard_file]) == 0:
+                                    to_delete = checkpoint_path / shard_file
+                                    if os.path.exists(to_delete):
+                                        logger.info("Deleted shard correctly after parsing discarded layers: %s", to_delete)
+                                        remove_real_and_linked_file(to_delete)
+                                    del shards_to_total_layers_count[shard_file]
 
                 del shard_state_dict
                 # We process incoming shards and delete them when NO MORE layers of that shard are expected to be processed.
@@ -309,6 +321,10 @@ def split_and_save_layers(
 
                 for layer in completed_layers:
                     layer_state_dict = partial_layers.pop(layer)
+                    
+                    # Store exact keys that belong to this mapped layer so we subtract them accurately
+                    layer_keys_consumed = list(layer_state_dict.keys())
+                    
                     layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
                     marker_exists = ModelPersister.get_model_persister().model_persist_exist(layer, saving_path)
                     if not marker_exists:
@@ -317,9 +333,6 @@ def split_and_save_layers(
                     pbar.update(1)
 
                     if delete_original:
-                        # Which original k did this layer consume? 
-                        # We just subtract any k starting with this layer from all shards that own them.
-                        layer_keys_consumed = [k for k in index.keys() if k.startswith(layer)]
                         for k_consumed in layer_keys_consumed:
                             s_file = index[k_consumed]
                             if s_file in shards_to_total_layers_count and k_consumed in shards_to_total_layers_count[s_file]:
@@ -334,6 +347,10 @@ def split_and_save_layers(
                 clean_memory()
 
         for layer, layer_state_dict in list(partial_layers.items()):
+            
+            # Store exact keys that belong to this mapped layer so we subtract them accurately
+            layer_keys_consumed = list(layer_state_dict.keys())
+            
             layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
             marker_exists = ModelPersister.get_model_persister().model_persist_exist(layer, saving_path)
             if not marker_exists:
@@ -341,7 +358,6 @@ def split_and_save_layers(
             del layer_state_dict
             
             if delete_original:
-                layer_keys_consumed = [k for k in index.keys() if k.startswith(layer)]
                 for k_consumed in layer_keys_consumed:
                     s_file = index[k_consumed]
                     if s_file in shards_to_total_layers_count and k_consumed in shards_to_total_layers_count[s_file]:
