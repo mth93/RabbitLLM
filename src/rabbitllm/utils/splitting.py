@@ -316,22 +316,31 @@ def split_and_save_layers(
                 processed_shards.add(shard_file)
 
                 completed_layers = []
-                for layer, tensors in partial_layers.items():
-                    if layer_to_shards[layer].issubset(processed_shards):
+                # We must check ALL layers that have finished their shards, not just the ones with data!
+                # If a layer has no data but all its shards are processed, it's effectively "completed" (zero keys loaded).
+                for layer, required_shards in layer_to_shards.items():
+                    if required_shards.issubset(processed_shards):
                         completed_layers.append(layer)
 
                 for layer in completed_layers:
-                    layer_state_dict = partial_layers.pop(layer)
+                    shards_for_this_layer = layer_to_shards[layer]
+                    # Remove it from layer_to_shards so we don't process it again
+                    del layer_to_shards[layer]
                     
-                    layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
-                    marker_exists = ModelPersister.get_model_persister().model_persist_exist(layer, saving_path)
-                    if not marker_exists:
-                        ModelPersister.get_model_persister().persist_model(layer_state_dict, layer, saving_path)
-                    del layer_state_dict
-                    pbar.update(1)
+                    if layer in partial_layers:
+                        layer_state_dict = partial_layers.pop(layer)
+                        layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
+                        marker_exists = ModelPersister.get_model_persister().model_persist_exist(layer, saving_path)
+                        if not marker_exists:
+                            ModelPersister.get_model_persister().persist_model(layer_state_dict, layer, saving_path)
+                        del layer_state_dict
+                        pbar.update(1)
+                    else:
+                        # Layer had no keys after all its shards were processed. Still update pbar.
+                        pbar.update(1)
 
                     if delete_original:
-                        for s_file in layer_to_shards.get(layer, []):
+                        for s_file in shards_for_this_layer:
                             if s_file in shard_to_layers and layer in shard_to_layers[s_file]:
                                 shard_to_layers[s_file].remove(layer)
                                 if len(shard_to_layers[s_file]) == 0:
@@ -343,6 +352,7 @@ def split_and_save_layers(
 
                 clean_memory()
 
+        # At the end, process whatever is left in partial_layers (should be none ideally)
         for layer, layer_state_dict in list(partial_layers.items()):
             
             layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
@@ -352,8 +362,8 @@ def split_and_save_layers(
             del layer_state_dict
             
             if delete_original:
-                for s_file in layer_to_shards.get(layer, []):
-                    if s_file in shard_to_layers and layer in shard_to_layers[s_file]:
+                for s_file in list(shard_to_layers.keys()):
+                    if layer in shard_to_layers[s_file]:
                         shard_to_layers[s_file].remove(layer)
                         if len(shard_to_layers[s_file]) == 0:
                             to_delete = checkpoint_path / s_file
