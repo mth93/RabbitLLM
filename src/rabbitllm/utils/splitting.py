@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import time
+import shutil
 from glob import glob
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
@@ -74,6 +75,31 @@ def remove_safe(path: Path) -> None:
                 tqdm.write(f"  Deleted orphaned blob: {blob_file.name}")
         except OSError:
             pass
+
+
+def cleanup_orphaned_blobs(cache_root: Path) -> None:
+    """
+    Scan the blobs directory and delete any file with link count 1 (orphaned).
+    """
+    blob_dir = cache_root / "blobs"
+    if not blob_dir.exists():
+        return
+
+    removed = 0
+    freed = 0
+    for f in blob_dir.iterdir():
+        if f.is_file():
+            try:
+                if f.stat().st_nlink == 1:
+                    size = f.stat().st_size
+                    f.unlink()
+                    removed += 1
+                    freed += size
+            except OSError:
+                continue
+
+    if removed > 0:
+        tqdm.write(f"Cleaned up {removed} orphaned blobs, freed {freed / 1024**3:.2f} GB")
 
 
 def log_disk_usage(cache_root: Path, checkpoint_path: Path, saving_path: Path) -> None:
@@ -186,6 +212,7 @@ def split_and_save_layers(
     token: Optional[str] = None,
     hf_token: Optional[str] = None,
     sequential_shard_processing: bool = False,
+    extreme_disk_cleanup: bool = False,  # <-- new flag
 ) -> str:
     logger.setLevel(logging.DEBUG)
 
@@ -498,6 +525,18 @@ def split_and_save_layers(
             else:
                 tqdm.write("All shard files have been deleted.")
 
+        # --- Extreme disk cleanup ---
+        if extreme_disk_cleanup:
+            tqdm.write("===== EXTREME DISK CLEANUP ACTIVATED =====")
+            # Delete the entire snapshot directory (original model files)
+            if checkpoint_path.exists():
+                shutil.rmtree(checkpoint_path)
+                tqdm.write(f"Deleted entire snapshot directory: {checkpoint_path}")
+            # Clean up orphaned blobs globally
+            hub_root = checkpoint_path.parent.parent.parent
+            cleanup_orphaned_blobs(hub_root)
+            tqdm.write("Extreme cleanup completed.")
+
         # Final disk usage summary
         hub_root = checkpoint_path.parent.parent.parent
         blob_dir = hub_root / "blobs"
@@ -620,6 +659,7 @@ def find_or_create_local_splitted_path(
     hf_token: Optional[str] = None,
     delete_original: bool = False,
     sequential_shard_processing: bool = False,
+    extreme_disk_cleanup: bool = False,  # <-- new flag
 ) -> Tuple[Path, str]:
     _token = token if token is not None else hf_token
 
@@ -637,6 +677,7 @@ def find_or_create_local_splitted_path(
                 layer_names=layer_names,
                 delete_original=delete_original,
                 sequential_shard_processing=sequential_shard_processing,
+                extreme_disk_cleanup=extreme_disk_cleanup,
             )
         else:
             logger.warning(
@@ -666,4 +707,5 @@ def find_or_create_local_splitted_path(
         repo_id=model_local_path_or_repo_id,
         token=_token,
         sequential_shard_processing=sequential_shard_processing,
+        extreme_disk_cleanup=extreme_disk_cleanup,
     )

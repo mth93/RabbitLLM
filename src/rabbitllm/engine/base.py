@@ -134,6 +134,7 @@ class RabbitLLMBaseModel(GenerationMixin):
         show_layer_progress: bool = True,
         cache_layers: Optional[int] = None,
         sequential_shard_processing: bool = False,
+        extreme_disk_cleanup: bool = False,
     ) -> None:
         """Initialize the layer-streaming model from a checkpoint or HuggingFace repo.
 
@@ -217,6 +218,7 @@ class RabbitLLMBaseModel(GenerationMixin):
             hf_token=self._token,
             delete_original=delete_original,
             sequential_shard_processing=sequential_shard_processing,
+            extreme_disk_cleanup=extreme_disk_cleanup
         )
         # Use CPU if CUDA was requested but is not available or fails to init
         if isinstance(device, str) and device.startswith("cuda"):
