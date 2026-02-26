@@ -24,15 +24,49 @@ from .memory import NotEnoughSpaceException, clean_memory
 logger = logging.getLogger(__name__)
 
 
-def remove_real_and_linked_file(to_delete: Union[Path, str]) -> None:
-    to_delete_str = str(to_delete)
-    targetpath = None
-    if os.path.realpath(to_delete_str) != to_delete_str:
-        targetpath = os.path.realpath(to_delete_str)
+def remove_safe(path: Path) -> None:
+    """
+    Remove a file, and if it's a hard link to a blob in the HF cache,
+    also remove the blob when it becomes unreferenced.
+    """
+    if not path.exists():
+        return
 
-    os.remove(to_delete)
-    if targetpath:
-        os.remove(targetpath)
+    # Get inode and link count before deletion
+    try:
+        stat_before = path.stat()
+        inode = stat_before.st_ino
+        nlink = stat_before.st_nlink
+    except OSError:
+        # If we can't stat, just delete the file and hope for the best
+        path.unlink()
+        return
+
+    # Locate the blob directory (HF cache structure)
+    # path is something like .../models--repo--id/snapshots/hash/filename
+    blob_dir = path.parent.parent / "blobs"
+    blob_file = None
+    if blob_dir.exists() and nlink > 1:
+        # Find the blob with the same inode
+        for f in blob_dir.iterdir():
+            if f.is_file():
+                try:
+                    if f.stat().st_ino == inode:
+                        blob_file = f
+                        break
+                except OSError:
+                    continue
+
+    # Now delete the snapshot file
+    path.unlink()
+
+    # If we found a blob and its link count was exactly 2 (one in snapshot, one in blobs),
+    # then after deletion the count becomes 1 and the blob can be removed.
+    if blob_file is not None and nlink == 2:
+        try:
+            blob_file.unlink()
+        except OSError:
+            pass  # If deletion fails, ignore
 
 
 def check_space(
@@ -281,7 +315,7 @@ def split_and_save_layers(
                     to_delete = checkpoint_path / shard_file
                     if os.path.exists(to_delete):
                         tqdm.write(f"Deleting shard (no target layers at all): {to_delete}")
-                        remove_real_and_linked_file(to_delete)
+                        remove_safe(to_delete)
                     if shard_file in shard_to_layers:
                         del shard_to_layers[shard_file]
 
@@ -318,8 +352,6 @@ def split_and_save_layers(
                             )
 
                         # --- Get saved file size ---
-                        # We need to know the exact filename used by persist_model.
-                        # Assuming it saves as e.g. "model.layers.0.safetensors"
                         layer_filename = layer.rstrip('.') + ".safetensors"
                         layer_file = saving_path / layer_filename
                         if layer_file.exists():
@@ -350,12 +382,12 @@ def split_and_save_layers(
                                     to_delete = checkpoint_path / s_file
                                     if os.path.exists(to_delete):
                                         tqdm.write(f"Deleting shard (all its layers processed): {to_delete}")
-                                        remove_real_and_linked_file(to_delete)
+                                        remove_safe(to_delete)
                                     del shard_to_layers[s_file]
 
                     # --- Periodic disk usage summary every 5 layers ---
                     if layers_processed % 5 == 0:
-                        # Remaining shards
+                        # Remaining shards in snapshot
                         remaining_shards = list(Path(checkpoint_path).glob("*.safetensors")) + list(
                             Path(checkpoint_path).glob("*.bin")
                         )
@@ -366,11 +398,18 @@ def split_and_save_layers(
                         split_files = list(saving_path.glob("*.safetensors"))
                         split_size_gb = sum(f.stat().st_size for f in split_files) / 1024**3
 
+                        # Blobs directory size (if exists)
+                        blob_dir = checkpoint_path.parent.parent / "blobs"
+                        blob_size_gb = 0
+                        if blob_dir.exists():
+                            blob_size_gb = sum(f.stat().st_size for f in blob_dir.glob("*") if f.is_file()) / 1024**3
+
                         tqdm.write(
                             f"--- After {layers_processed} layers ---\n"
                             f"  Remaining shards: {shard_count} files, {shard_size_gb:.2f} GB\n"
                             f"  Split layers: {len(split_files)} files, {split_size_gb:.2f} GB\n"
-                            f"  Total used: {shard_size_gb + split_size_gb:.2f} GB"
+                            f"  Blobs directory: {blob_size_gb:.2f} GB\n"
+                            f"  Total accounted: {shard_size_gb + split_size_gb + blob_size_gb:.2f} GB"
                         )
 
                 clean_memory()
@@ -407,7 +446,7 @@ def split_and_save_layers(
                             to_delete = checkpoint_path / s_file
                             if os.path.exists(to_delete):
                                 tqdm.write(f"Deleting shard (all its layers processed in leftover): {to_delete}")
-                                remove_real_and_linked_file(to_delete)
+                                remove_safe(to_delete)
                             del shard_to_layers[s_file]
 
         partial_layers.clear()
@@ -424,7 +463,7 @@ def split_and_save_layers(
                 to_delete = checkpoint_path / s_file
                 if os.path.exists(to_delete):
                     tqdm.write(f"Deleting remaining shard at end: {to_delete}")
-                    remove_real_and_linked_file(to_delete)
+                    remove_safe(to_delete)
                 del shard_to_layers[s_file]
 
             remaining_files = list(Path(checkpoint_path).glob("*.safetensors")) + list(
@@ -443,13 +482,19 @@ def split_and_save_layers(
             Path(checkpoint_path).glob("*.bin")
         )
         final_split = list(saving_path.glob("*.safetensors"))
+        blob_dir = checkpoint_path.parent.parent / "blobs"
+        blob_size_gb = 0
+        if blob_dir.exists():
+            blob_size_gb = sum(f.stat().st_size for f in blob_dir.glob("*") if f.is_file()) / 1024**3
+
         tqdm.write(
             "===== FINAL DISK USAGE =====\n"
             f"Shards remaining: {len(final_shards)} files, "
             f"{sum(f.stat().st_size for f in final_shards) / 1024**3:.2f} GB\n"
             f"Split layers: {len(final_split)} files, "
             f"{sum(f.stat().st_size for f in final_split) / 1024**3:.2f} GB\n"
-            f"Total: {(sum(f.stat().st_size for f in final_shards) + sum(f.stat().st_size for f in final_split)) / 1024**3:.2f} GB"
+            f"Blobs directory: {blob_size_gb:.2f} GB\n"
+            f"Total: {(sum(f.stat().st_size for f in final_shards) + sum(f.stat().st_size for f in final_split) + (sum(f.stat().st_size for f in blob_dir.glob('*') if f.is_file()) if blob_dir.exists() else 0)) / 1024**3:.2f} GB"
         )
 
         clean_memory()
@@ -478,7 +523,7 @@ def split_and_save_layers(
                                 )
 
                             logger.info("Deleted shard: %s", to_delete)
-                            remove_real_and_linked_file(to_delete)
+                            remove_safe(to_delete)
                         shard += 1
                         logger.info("Loading shard %s/%s", shard, n_shards)
 
@@ -535,7 +580,7 @@ def split_and_save_layers(
     if delete_original and single_modelfile is not None:
         to_delete = checkpoint_path / single_modelfile
         logger.info("Deleted original file: %s", to_delete)
-        remove_real_and_linked_file(to_delete)
+        remove_safe(to_delete)
 
     return str(saving_path)
 
