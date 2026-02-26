@@ -32,22 +32,22 @@ def remove_safe(path: Path) -> None:
     if not path.exists():
         return
 
-    # Get inode and link count before deletion
-    try:
-        stat_before = path.stat()
-        inode = stat_before.st_ino
-        nlink = stat_before.st_nlink
-    except OSError:
-        # If we can't stat, just delete the file and hope for the best
-        path.unlink()
-        return
-
     # Locate the blob directory (HF cache structure)
     # path is something like .../models--repo--id/snapshots/hash/filename
     blob_dir = path.parent.parent / "blobs"
     blob_file = None
-    if blob_dir.exists() and nlink > 1:
-        # Find the blob with the same inode
+
+    # Get inode of the snapshot file
+    try:
+        stat_before = path.stat()
+        inode = stat_before.st_ino
+    except OSError:
+        # If we can't stat, just delete the file
+        path.unlink()
+        return
+
+    # Find the corresponding blob file (if any) by inode
+    if blob_dir.exists():
         for f in blob_dir.iterdir():
             if f.is_file():
                 try:
@@ -60,13 +60,40 @@ def remove_safe(path: Path) -> None:
     # Now delete the snapshot file
     path.unlink()
 
-    # If we found a blob and its link count was exactly 2 (one in snapshot, one in blobs),
-    # then after deletion the count becomes 1 and the blob can be removed.
-    if blob_file is not None and nlink == 2:
+    # If we found a blob file, check its link count after deletion
+    if blob_file is not None and blob_file.exists():
         try:
-            blob_file.unlink()
+            # After deleting the snapshot, the blob's link count should be 1 if no other snapshots reference it
+            if blob_file.stat().st_nlink == 1:
+                blob_file.unlink()
+                tqdm.write(f"  Deleted orphaned blob: {blob_file.name}")
         except OSError:
-            pass  # If deletion fails, ignore
+            pass
+
+
+def cleanup_orphaned_blobs(cache_root: Path) -> None:
+    """
+    Scan the blobs directory and delete any file with link count 1 (orphaned).
+    """
+    blob_dir = cache_root / "blobs"
+    if not blob_dir.exists():
+        return
+
+    removed = 0
+    freed = 0
+    for f in blob_dir.iterdir():
+        if f.is_file():
+            try:
+                if f.stat().st_nlink == 1:
+                    size = f.stat().st_size
+                    f.unlink()
+                    removed += 1
+                    freed += size
+            except OSError:
+                continue
+
+    if removed > 0:
+        tqdm.write(f"Cleaned up {removed} orphaned blobs, freed {freed / 1024**3:.2f} GB")
 
 
 def check_space(
@@ -477,12 +504,16 @@ def split_and_save_layers(
             else:
                 tqdm.write("All shard files have been deleted.")
 
+        # Final cleanup: remove orphaned blobs
+        cache_root = checkpoint_path.parent.parent.parent  # e.g., /root/.cache/huggingface/hub
+        cleanup_orphaned_blobs(cache_root)
+
         # Final disk usage summary
         final_shards = list(Path(checkpoint_path).glob("*.safetensors")) + list(
             Path(checkpoint_path).glob("*.bin")
         )
         final_split = list(saving_path.glob("*.safetensors"))
-        blob_dir = checkpoint_path.parent.parent / "blobs"
+        blob_dir = cache_root / "blobs"
         blob_size_gb = 0
         if blob_dir.exists():
             blob_size_gb = sum(f.stat().st_size for f in blob_dir.glob("*") if f.is_file()) / 1024**3
