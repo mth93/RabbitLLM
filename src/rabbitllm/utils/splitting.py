@@ -28,13 +28,16 @@ def remove_safe(path: Path) -> None:
     """
     Remove a file, and if it's a hard link to a blob in the HF cache,
     also remove the blob when it becomes unreferenced.
+    Logs the action.
     """
     if not path.exists():
         return
 
     # Locate the blob directory (HF cache structure)
-    # path is something like .../models--repo--id/snapshots/hash/filename
-    blob_dir = path.parent.parent / "blobs"
+    # path is like .../hub/models--repo--id/snapshots/hash/filename
+    # blob directory is at .../hub/blobs
+    hub_root = path.parent.parent.parent
+    blob_dir = hub_root / "blobs"
     blob_file = None
 
     # Get inode of the snapshot file
@@ -44,6 +47,7 @@ def remove_safe(path: Path) -> None:
     except OSError:
         # If we can't stat, just delete the file
         path.unlink()
+        tqdm.write(f"  Removed {path.name} (could not stat, blob not tracked)")
         return
 
     # Find the corresponding blob file (if any) by inode
@@ -59,6 +63,7 @@ def remove_safe(path: Path) -> None:
 
     # Now delete the snapshot file
     path.unlink()
+    tqdm.write(f"  Deleted snapshot file: {path.name}")
 
     # If we found a blob file, check its link count after deletion
     if blob_file is not None and blob_file.exists():
@@ -71,29 +76,39 @@ def remove_safe(path: Path) -> None:
             pass
 
 
-def cleanup_orphaned_blobs(cache_root: Path) -> None:
+def log_disk_usage(cache_root: Path, checkpoint_path: Path, saving_path: Path) -> None:
     """
-    Scan the blobs directory and delete any file with link count 1 (orphaned).
+    Log current disk usage: blob directory size and total HF cache size.
+    Called after each shard deletion.
     """
     blob_dir = cache_root / "blobs"
-    if not blob_dir.exists():
-        return
+    blob_size = 0
+    if blob_dir.exists():
+        blob_size = sum(f.stat().st_size for f in blob_dir.glob("*") if f.is_file()) / 1024**3
 
-    removed = 0
-    freed = 0
-    for f in blob_dir.iterdir():
-        if f.is_file():
-            try:
-                if f.stat().st_nlink == 1:
-                    size = f.stat().st_size
-                    f.unlink()
-                    removed += 1
-                    freed += size
-            except OSError:
-                continue
+    # Also compute total cache size (hub directory)
+    cache_size = 0
+    if cache_root.exists():
+        cache_size = sum(f.stat().st_size for f in cache_root.rglob("*") if f.is_file()) / 1024**3
 
-    if removed > 0:
-        tqdm.write(f"Cleaned up {removed} orphaned blobs, freed {freed / 1024**3:.2f} GB")
+    # Remaining shards in snapshot
+    remaining_shards = list(Path(checkpoint_path).glob("*.safetensors")) + list(
+        Path(checkpoint_path).glob("*.bin")
+    )
+    shard_count = len(remaining_shards)
+    shard_size = sum(f.stat().st_size for f in remaining_shards) / 1024**3
+
+    # Split layers size
+    split_files = list(saving_path.glob("*.safetensors"))
+    split_size = sum(f.stat().st_size for f in split_files) / 1024**3
+
+    tqdm.write(
+        f"--- Disk Usage After Deletion ---\n"
+        f"  Remaining shards: {shard_count} files, {shard_size:.2f} GB\n"
+        f"  Split layers: {len(split_files)} files, {split_size:.2f} GB\n"
+        f"  Blobs directory: {blob_size:.2f} GB\n"
+        f"  Total HF cache: {cache_size:.2f} GB"
+    )
 
 
 def check_space(
@@ -307,7 +322,7 @@ def split_and_save_layers(
         processed_shards = set()
         partial_layers = {}
         total_layers = len(layer_to_shards)
-        layers_processed = 0  # counter for periodic disk usage report
+        layers_processed = 0
 
         with tqdm(total=total_layers, desc="Assembling layers sequentially") as pbar:
             for shard_idx, shard_file in enumerate(sorted_shards, 1):
@@ -341,8 +356,10 @@ def split_and_save_layers(
                 if delete_original and (shard_file not in shard_to_layers or len(shard_to_layers[shard_file]) == 0):
                     to_delete = checkpoint_path / shard_file
                     if os.path.exists(to_delete):
-                        tqdm.write(f"Deleting shard (no target layers at all): {to_delete}")
                         remove_safe(to_delete)
+                        # After deletion, log disk usage
+                        hub_root = checkpoint_path.parent.parent.parent
+                        log_disk_usage(hub_root, checkpoint_path, saving_path)
                     if shard_file in shard_to_layers:
                         del shard_to_layers[shard_file]
 
@@ -408,36 +425,11 @@ def split_and_save_layers(
                                 if len(remaining) == 0:
                                     to_delete = checkpoint_path / s_file
                                     if os.path.exists(to_delete):
-                                        tqdm.write(f"Deleting shard (all its layers processed): {to_delete}")
                                         remove_safe(to_delete)
+                                        # After deletion, log disk usage
+                                        hub_root = checkpoint_path.parent.parent.parent
+                                        log_disk_usage(hub_root, checkpoint_path, saving_path)
                                     del shard_to_layers[s_file]
-
-                    # --- Periodic disk usage summary every 5 layers ---
-                    if layers_processed % 5 == 0:
-                        # Remaining shards in snapshot
-                        remaining_shards = list(Path(checkpoint_path).glob("*.safetensors")) + list(
-                            Path(checkpoint_path).glob("*.bin")
-                        )
-                        shard_count = len(remaining_shards)
-                        shard_size_gb = sum(f.stat().st_size for f in remaining_shards) / 1024**3
-
-                        # Split layers size
-                        split_files = list(saving_path.glob("*.safetensors"))
-                        split_size_gb = sum(f.stat().st_size for f in split_files) / 1024**3
-
-                        # Blobs directory size (if exists)
-                        blob_dir = checkpoint_path.parent.parent / "blobs"
-                        blob_size_gb = 0
-                        if blob_dir.exists():
-                            blob_size_gb = sum(f.stat().st_size for f in blob_dir.glob("*") if f.is_file()) / 1024**3
-
-                        tqdm.write(
-                            f"--- After {layers_processed} layers ---\n"
-                            f"  Remaining shards: {shard_count} files, {shard_size_gb:.2f} GB\n"
-                            f"  Split layers: {len(split_files)} files, {split_size_gb:.2f} GB\n"
-                            f"  Blobs directory: {blob_size_gb:.2f} GB\n"
-                            f"  Total accounted: {shard_size_gb + split_size_gb + blob_size_gb:.2f} GB"
-                        )
 
                 clean_memory()
 
@@ -472,8 +464,9 @@ def split_and_save_layers(
                         if len(shard_to_layers[s_file]) == 0:
                             to_delete = checkpoint_path / s_file
                             if os.path.exists(to_delete):
-                                tqdm.write(f"Deleting shard (all its layers processed in leftover): {to_delete}")
                                 remove_safe(to_delete)
+                                hub_root = checkpoint_path.parent.parent.parent
+                                log_disk_usage(hub_root, checkpoint_path, saving_path)
                             del shard_to_layers[s_file]
 
         partial_layers.clear()
@@ -489,8 +482,9 @@ def split_and_save_layers(
             for s_file in list(shard_to_layers.keys()):
                 to_delete = checkpoint_path / s_file
                 if os.path.exists(to_delete):
-                    tqdm.write(f"Deleting remaining shard at end: {to_delete}")
                     remove_safe(to_delete)
+                    hub_root = checkpoint_path.parent.parent.parent
+                    log_disk_usage(hub_root, checkpoint_path, saving_path)
                 del shard_to_layers[s_file]
 
             remaining_files = list(Path(checkpoint_path).glob("*.safetensors")) + list(
@@ -504,27 +498,24 @@ def split_and_save_layers(
             else:
                 tqdm.write("All shard files have been deleted.")
 
-        # Final cleanup: remove orphaned blobs
-        cache_root = checkpoint_path.parent.parent.parent  # e.g., /root/.cache/huggingface/hub
-        cleanup_orphaned_blobs(cache_root)
-
         # Final disk usage summary
+        hub_root = checkpoint_path.parent.parent.parent
+        blob_dir = hub_root / "blobs"
+        blob_size = 0
+        if blob_dir.exists():
+            blob_size = sum(f.stat().st_size for f in blob_dir.glob("*") if f.is_file()) / 1024**3
+
         final_shards = list(Path(checkpoint_path).glob("*.safetensors")) + list(
             Path(checkpoint_path).glob("*.bin")
         )
         final_split = list(saving_path.glob("*.safetensors"))
-        blob_dir = cache_root / "blobs"
-        blob_size_gb = 0
-        if blob_dir.exists():
-            blob_size_gb = sum(f.stat().st_size for f in blob_dir.glob("*") if f.is_file()) / 1024**3
-
         tqdm.write(
             "===== FINAL DISK USAGE =====\n"
             f"Shards remaining: {len(final_shards)} files, "
             f"{sum(f.stat().st_size for f in final_shards) / 1024**3:.2f} GB\n"
             f"Split layers: {len(final_split)} files, "
             f"{sum(f.stat().st_size for f in final_split) / 1024**3:.2f} GB\n"
-            f"Blobs directory: {blob_size_gb:.2f} GB\n"
+            f"Blobs directory: {blob_size:.2f} GB\n"
             f"Total: {(sum(f.stat().st_size for f in final_shards) + sum(f.stat().st_size for f in final_split) + (sum(f.stat().st_size for f in blob_dir.glob('*') if f.is_file()) if blob_dir.exists() else 0)) / 1024**3:.2f} GB"
         )
 
@@ -555,6 +546,8 @@ def split_and_save_layers(
 
                             logger.info("Deleted shard: %s", to_delete)
                             remove_safe(to_delete)
+                            hub_root = checkpoint_path.parent.parent.parent
+                            log_disk_usage(hub_root, checkpoint_path, saving_path)
                         shard += 1
                         logger.info("Loading shard %s/%s", shard, n_shards)
 
@@ -612,6 +605,8 @@ def split_and_save_layers(
         to_delete = checkpoint_path / single_modelfile
         logger.info("Deleted original file: %s", to_delete)
         remove_safe(to_delete)
+        hub_root = checkpoint_path.parent.parent.parent
+        log_disk_usage(hub_root, checkpoint_path, saving_path)
 
     return str(saving_path)
 
