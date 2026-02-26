@@ -54,8 +54,6 @@ def check_space(
             total_saved_split_files_size_bytes += os.path.getsize(saved_split_file)
 
     if compression == "4bit":
-        # 4-bit output is ~28% of the bfloat16 input size.
-        # Previous code divided (/ 0.2813) which vastly overestimated needed space.
         total_shard_files_size_bytes = int(total_shard_files_size_bytes * 0.2813)
     elif compression == "8bit":
         total_shard_files_size_bytes = total_shard_files_size_bytes // 2
@@ -86,20 +84,6 @@ def load_layer(
     persister: Optional[Any] = None,
     decompress: bool = True,
 ) -> Union[Dict[str, Any], Tuple[Dict[str, Any], float]]:
-    """Load a single layer state_dict from the split checkpoint, optionally with timing.
-
-    Args:
-        local_path: Path to the split checkpoint directory.
-        layer_name: Layer key (e.g. "model.layers.0").
-        profiling: If True, return (state_dict, elapsed_time) else state_dict.
-        persister: Optional ModelPersister; if None, uses get_model_persister().
-        decompress: If True (default), decompress 4-bit/8-bit layers on load.
-            Pass False when using the async transfer pipeline so that decompression
-            is deferred to the GPU after the async copy (see layer_loading.py).
-
-    Returns:
-        state_dict, or (state_dict, float) when profiling=True.
-    """
     p = persister if persister is not None else ModelPersister.get_model_persister()
     layer_state_dict = p.load_model(layer_name, local_path)
 
@@ -127,26 +111,7 @@ def split_and_save_layers(
     hf_token: Optional[str] = None,
     sequential_shard_processing: bool = False,
 ) -> str:
-    """Split a sharded checkpoint into per-layer safetensors and save to disk.
-
-    Args:
-        checkpoint_path: Path to the checkpoint dir (must contain index JSON).
-        layer_shards_saving_path: Optional base path for split output.
-        splitted_model_dir_name: Subdir name (suffix .4bit/.8bit added if compression set).
-        compression: "4bit" or "8bit" for quantized layers (requires bitsandbytes).
-        layer_names: Dict with embed, layer_prefix, norm, lm_head keys; inferred if None.
-        delete_original: If True, remove original shard files after saving each layer.
-        repo_id: HuggingFace repo ID for re-downloading missing shards.
-        token: HuggingFace token for gated repos (preferred; v5 uses this).
-        hf_token: Deprecated alias for ``token``.
-
-    Returns:
-        Path to the directory containing the split layer files (as string).
-    """
-    # Ensure debug logs are visible (set level to DEBUG)
     logger.setLevel(logging.DEBUG)
-    # If you want logs to also appear in the notebook, you may need to add a handler,
-    # but we'll rely on tqdm.write for critical debug inside the sequential block.
 
     _token = token if token is not None else hf_token
 
@@ -155,9 +120,7 @@ def split_and_save_layers(
         splitted_model_dir_name = splitted_model_dir_name + "." + compression
 
     checkpoint_path = Path(checkpoint_path)
-
     saving_path = checkpoint_path / splitted_model_dir_name
-
     if layer_shards_saving_path is not None:
         saving_path = Path(layer_shards_saving_path) / splitted_model_dir_name
 
@@ -256,11 +219,11 @@ def split_and_save_layers(
         state_dict = load_file(single_file_path, device="cpu")
 
     if sequential_shard_processing and not single_file_model:
-        # Use tqdm.write for debug output to ensure visibility in Jupyter
         tqdm.write("===== ENTERING SEQUENTIAL SHARD PROCESSING MODE =====")
+        tqdm.write(f"Compression setting: {compression}")
         layer_to_shards = {}
         shard_to_layers = {}
-        
+
         tqdm.write("Building layer-to-shards and shard-to-layers from index...")
         for k, v in index.items():
             matched_layer = None
@@ -272,20 +235,18 @@ def split_and_save_layers(
                 if matched_layer not in layer_to_shards:
                     layer_to_shards[matched_layer] = set()
                 layer_to_shards[matched_layer].add(v)
-                
+
                 if v not in shard_to_layers:
                     shard_to_layers[v] = set()
                 shard_to_layers[v].add(matched_layer)
             else:
                 tqdm.write(f"Key {k} did not match any known layer prefix. It will be ignored.")
-        
-        tqdm.write(f"Layer to shards mapping: {layer_to_shards}")
-        tqdm.write(f"Shard to layers mapping: {shard_to_layers}")
 
         sorted_shards = sorted(list(set(index.values())))
         processed_shards = set()
         partial_layers = {}
         total_layers = len(layer_to_shards)
+        layers_processed = 0  # counter for periodic disk usage report
 
         with tqdm(total=total_layers, desc="Assembling layers sequentially") as pbar:
             for shard_idx, shard_file in enumerate(sorted_shards, 1):
@@ -303,7 +264,6 @@ def split_and_save_layers(
                 else:
                     shard_state_dict = load_file(to_load, device="cpu")
 
-                # Collect keys from this shard
                 for k, v in shard_state_dict.items():
                     matched_layer = None
                     for layer in layers:
@@ -314,12 +274,9 @@ def split_and_save_layers(
                         if matched_layer not in partial_layers:
                             partial_layers[matched_layer] = {}
                         partial_layers[matched_layer][k] = v
-                    # else: ignore (should not happen because we built mapping from index)
 
                 del shard_state_dict
-                
-                # Check if this shard had NO matched layers whatsoever (all keys discarded)
-                # This can happen if the index says a shard contains a key, but that key's layer prefix is not in our 'layers' list.
+
                 if delete_original and (shard_file not in shard_to_layers or len(shard_to_layers[shard_file]) == 0):
                     to_delete = checkpoint_path / shard_file
                     if os.path.exists(to_delete):
@@ -327,38 +284,63 @@ def split_and_save_layers(
                         remove_real_and_linked_file(to_delete)
                     if shard_file in shard_to_layers:
                         del shard_to_layers[shard_file]
-                
+
                 processed_shards.add(shard_file)
 
                 completed_layers = []
-                # Find all layers whose required shards are fully processed
                 for layer, required_shards in layer_to_shards.items():
                     if required_shards.issubset(processed_shards):
                         completed_layers.append(layer)
 
                 for layer in completed_layers:
                     shards_for_this_layer = layer_to_shards[layer]
-                    # Remove it from layer_to_shards so we don't process it again
                     del layer_to_shards[layer]
-                    
+
                     tqdm.write(f"Layer {layer} is now complete. Required shards: {shards_for_this_layer}")
-                    
+
                     if layer in partial_layers:
                         layer_state_dict = partial_layers.pop(layer)
+
+                        # --- Calculate uncompressed size ---
+                        uncompressed_bytes = sum(
+                            v.numel() * v.element_size() for v in layer_state_dict.values()
+                        )
+                        uncompressed_gb = uncompressed_bytes / 1024**3
+
+                        # --- Compress and save ---
                         layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
-                        marker_exists = ModelPersister.get_model_persister().model_persist_exist(layer, saving_path)
+                        marker_exists = ModelPersister.get_model_persister().model_persist_exist(
+                            layer, saving_path
+                        )
                         if not marker_exists:
-                            tqdm.write(f"Persisting layer {layer}")
-                            ModelPersister.get_model_persister().persist_model(layer_state_dict, layer, saving_path)
+                            ModelPersister.get_model_persister().persist_model(
+                                layer_state_dict, layer, saving_path
+                            )
+
+                        # --- Get saved file size ---
+                        # We need to know the exact filename used by persist_model.
+                        # Assuming it saves as e.g. "model.layers.0.safetensors"
+                        layer_filename = layer.rstrip('.') + ".safetensors"
+                        layer_file = saving_path / layer_filename
+                        if layer_file.exists():
+                            saved_bytes = layer_file.stat().st_size
+                            saved_gb = saved_bytes / 1024**3
+                            ratio = saved_bytes / uncompressed_bytes if uncompressed_bytes > 0 else 0
+                            tqdm.write(
+                                f"  Compressed {layer}: original {uncompressed_gb:.3f} GB, "
+                                f"saved {saved_gb:.3f} GB (ratio {ratio:.2f})"
+                            )
+                        else:
+                            tqdm.write(f"  WARNING: Saved layer file not found: {layer_file}")
+
                         del layer_state_dict
+                        layers_processed += 1
                         pbar.update(1)
                     else:
-                        # Layer had no keys after all its shards were processed. This could happen if the layer prefix matched but no actual keys were collected (unlikely).
                         tqdm.write(f"WARNING: Layer {layer} was completed but had no state dict keys!")
                         pbar.update(1)
 
                     if delete_original:
-                        # After saving the layer, try to delete any shard that now has no remaining layers
                         for s_file in shards_for_this_layer:
                             if s_file in shard_to_layers and layer in shard_to_layers[s_file]:
                                 shard_to_layers[s_file].remove(layer)
@@ -371,17 +353,52 @@ def split_and_save_layers(
                                         remove_real_and_linked_file(to_delete)
                                     del shard_to_layers[s_file]
 
+                    # --- Periodic disk usage summary every 5 layers ---
+                    if layers_processed % 5 == 0:
+                        # Remaining shards
+                        remaining_shards = list(Path(checkpoint_path).glob("*.safetensors")) + list(
+                            Path(checkpoint_path).glob("*.bin")
+                        )
+                        shard_count = len(remaining_shards)
+                        shard_size_gb = sum(f.stat().st_size for f in remaining_shards) / 1024**3
+
+                        # Split layers size
+                        split_files = list(saving_path.glob("*.safetensors"))
+                        split_size_gb = sum(f.stat().st_size for f in split_files) / 1024**3
+
+                        tqdm.write(
+                            f"--- After {layers_processed} layers ---\n"
+                            f"  Remaining shards: {shard_count} files, {shard_size_gb:.2f} GB\n"
+                            f"  Split layers: {len(split_files)} files, {split_size_gb:.2f} GB\n"
+                            f"  Total used: {shard_size_gb + split_size_gb:.2f} GB"
+                        )
+
                 clean_memory()
 
-        # At the end, process whatever is left in partial_layers (should be none ideally)
+        # At the end, process leftovers (if any)
         for layer, layer_state_dict in list(partial_layers.items()):
             tqdm.write(f"Processing leftover partial layer: {layer}")
+            uncompressed_bytes = sum(v.numel() * v.element_size() for v in layer_state_dict.values())
+            uncompressed_gb = uncompressed_bytes / 1024**3
+
             layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
             marker_exists = ModelPersister.get_model_persister().model_persist_exist(layer, saving_path)
             if not marker_exists:
                 ModelPersister.get_model_persister().persist_model(layer_state_dict, layer, saving_path)
+
+            layer_filename = layer.rstrip('.') + ".safetensors"
+            layer_file = saving_path / layer_filename
+            if layer_file.exists():
+                saved_bytes = layer_file.stat().st_size
+                saved_gb = saved_bytes / 1024**3
+                ratio = saved_bytes / uncompressed_bytes if uncompressed_bytes > 0 else 0
+                tqdm.write(
+                    f"  Compressed leftover {layer}: original {uncompressed_gb:.3f} GB, "
+                    f"saved {saved_gb:.3f} GB (ratio {ratio:.2f})"
+                )
+
             del layer_state_dict
-            
+
             if delete_original:
                 for s_file in list(shard_to_layers.keys()):
                     if layer in shard_to_layers[s_file]:
@@ -392,32 +409,49 @@ def split_and_save_layers(
                                 tqdm.write(f"Deleting shard (all its layers processed in leftover): {to_delete}")
                                 remove_real_and_linked_file(to_delete)
                             del shard_to_layers[s_file]
-                
+
         partial_layers.clear()
-        
-        # Final check for any shards that still have layers recorded
+
         if delete_original:
             for s_file, remaining_layers in list(shard_to_layers.items()):
                 if len(remaining_layers) > 0:
-                    tqdm.write(f"WARNING: Shard {s_file} still has {len(remaining_layers)} layers preventing its deletion! Sample: {list(remaining_layers)}")
-        
-        # Force delete any remaining shards if they exist (should be zero if mapping was correct)
-        if delete_original:
+                    tqdm.write(
+                        f"WARNING: Shard {s_file} still has {len(remaining_layers)} layers "
+                        f"preventing its deletion! Sample: {list(remaining_layers)}"
+                    )
+
             for s_file in list(shard_to_layers.keys()):
                 to_delete = checkpoint_path / s_file
                 if os.path.exists(to_delete):
                     tqdm.write(f"Deleting remaining shard at end: {to_delete}")
                     remove_real_and_linked_file(to_delete)
                 del shard_to_layers[s_file]
-        
-        # Also scan directory for any leftover shard files that weren't in shard_to_layers (e.g., if mapping was incomplete)
-        if delete_original:
-            remaining_files = list(Path(checkpoint_path).glob("*.safetensors")) + list(Path(checkpoint_path).glob("*.bin"))
+
+            remaining_files = list(Path(checkpoint_path).glob("*.safetensors")) + list(
+                Path(checkpoint_path).glob("*.bin")
+            )
             if remaining_files:
-                tqdm.write(f"WARNING: After processing, some shard files still exist: {[f.name for f in remaining_files]}")
+                tqdm.write(
+                    f"WARNING: After processing, some shard files still exist: "
+                    f"{[f.name for f in remaining_files]}"
+                )
             else:
                 tqdm.write("All shard files have been deleted.")
-                
+
+        # Final disk usage summary
+        final_shards = list(Path(checkpoint_path).glob("*.safetensors")) + list(
+            Path(checkpoint_path).glob("*.bin")
+        )
+        final_split = list(saving_path.glob("*.safetensors"))
+        tqdm.write(
+            "===== FINAL DISK USAGE =====\n"
+            f"Shards remaining: {len(final_shards)} files, "
+            f"{sum(f.stat().st_size for f in final_shards) / 1024**3:.2f} GB\n"
+            f"Split layers: {len(final_split)} files, "
+            f"{sum(f.stat().st_size for f in final_split) / 1024**3:.2f} GB\n"
+            f"Total: {(sum(f.stat().st_size for f in final_shards) + sum(f.stat().st_size for f in final_split)) / 1024**3:.2f} GB"
+        )
+
         clean_memory()
 
     else:
@@ -516,23 +550,6 @@ def find_or_create_local_splitted_path(
     delete_original: bool = False,
     sequential_shard_processing: bool = False,
 ) -> Tuple[Path, str]:
-    """Resolve local checkpoint path and ensure the model is split into per-layer files.
-
-    If the path is local and has an index, splits in place. Otherwise downloads from
-    HuggingFace (model_local_path_or_repo_id as repo ID) then splits.
-
-    Args:
-        model_local_path_or_repo_id: Local path or HuggingFace repo ID.
-        layer_shards_saving_path: Optional base path for split output.
-        compression: "4bit" or "8bit" for quantized layers.
-        layer_names: Dict for layer naming; inferred if None.
-        token: HuggingFace token for gated repos (preferred; v5 uses this).
-        hf_token: Deprecated alias for ``token``.
-        delete_original: If True, delete original shards after splitting.
-
-    Returns:
-        Tuple of (model_local_path, split_dir_path) where split_dir_path is the split output.
-    """
     _token = token if token is not None else hf_token
 
     if os.path.exists(model_local_path_or_repo_id):
