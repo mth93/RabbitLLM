@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import time
+import gc
 import shutil
 from glob import glob
 from pathlib import Path
@@ -23,6 +24,22 @@ from .compression import (
 from .memory import NotEnoughSpaceException, clean_memory
 
 logger = logging.getLogger(__name__)
+
+
+def force_filesystem_sync():
+    """
+    Force filesystem sync and garbage collection to ensure disk usage stats are updated.
+    This helps the Kaggle monitor reflect freed space more quickly.
+    """
+    # Flush filesystem buffers (Linux)
+    os.system("sync")
+    # Force Python garbage collection
+    gc.collect()
+    # Clear CUDA cache if available
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    # Small delay to allow system to update
+    time.sleep(0.5)
 
 
 def remove_safe(path: Path) -> None:
@@ -76,6 +93,9 @@ def remove_safe(path: Path) -> None:
         except OSError:
             pass
 
+    # Force filesystem sync after deletion
+    force_filesystem_sync()
+
 
 def cleanup_orphaned_blobs(cache_root: Path) -> None:
     """
@@ -100,6 +120,7 @@ def cleanup_orphaned_blobs(cache_root: Path) -> None:
 
     if removed > 0:
         tqdm.write(f"Cleaned up {removed} orphaned blobs, freed {freed / 1024**3:.2f} GB")
+        force_filesystem_sync()
 
 
 def log_disk_usage(cache_root: Path, checkpoint_path: Path, saving_path: Path) -> None:
@@ -107,6 +128,9 @@ def log_disk_usage(cache_root: Path, checkpoint_path: Path, saving_path: Path) -
     Log current disk usage: blob directory size and total HF cache size.
     Called after each shard deletion.
     """
+    # Ensure filesystem is synced before reading stats
+    force_filesystem_sync()
+
     blob_dir = cache_root / "blobs"
     blob_size = 0
     if blob_dir.exists():
@@ -212,7 +236,7 @@ def split_and_save_layers(
     token: Optional[str] = None,
     hf_token: Optional[str] = None,
     sequential_shard_processing: bool = False,
-    extreme_disk_cleanup: bool = False,  # <-- new flag
+    extreme_disk_cleanup: bool = False,
 ) -> str:
     logger.setLevel(logging.DEBUG)
 
@@ -532,6 +556,7 @@ def split_and_save_layers(
             if checkpoint_path.exists():
                 shutil.rmtree(checkpoint_path)
                 tqdm.write(f"Deleted entire snapshot directory: {checkpoint_path}")
+                force_filesystem_sync()
             # Clean up orphaned blobs globally
             hub_root = checkpoint_path.parent.parent.parent
             cleanup_orphaned_blobs(hub_root)
@@ -539,6 +564,7 @@ def split_and_save_layers(
 
         # Final disk usage summary
         hub_root = checkpoint_path.parent.parent.parent
+        force_filesystem_sync()  # Ensure latest stats
         blob_dir = hub_root / "blobs"
         blob_size = 0
         if blob_dir.exists():
@@ -659,7 +685,7 @@ def find_or_create_local_splitted_path(
     hf_token: Optional[str] = None,
     delete_original: bool = False,
     sequential_shard_processing: bool = False,
-    extreme_disk_cleanup: bool = False,  # <-- new flag
+    extreme_disk_cleanup: bool = False,
 ) -> Tuple[Path, str]:
     _token = token if token is not None else hf_token
 
