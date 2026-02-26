@@ -251,9 +251,13 @@ def split_and_save_layers(
         state_dict = load_file(single_file_path, device="cpu")
 
     if sequential_shard_processing and not single_file_model:
+        # DEBUG: Log entry into sequential mode
+        logger.debug("===== ENTERING SEQUENTIAL SHARD PROCESSING MODE =====")
         layer_to_shards = {}
         shard_to_layers = {}
         
+        # Build mappings
+        logger.debug("Building layer-to-shards and shard-to-layers from index...")
         for k, v in index.items():
             matched_layer = None
             for layer in layers:
@@ -268,6 +272,12 @@ def split_and_save_layers(
                 if v not in shard_to_layers:
                     shard_to_layers[v] = set()
                 shard_to_layers[v].add(matched_layer)
+            else:
+                # DEBUG: Log keys that do not match any layer (could be tied weights or irrelevant)
+                logger.debug(f"Key {k} did not match any known layer prefix. It will be ignored.")
+        
+        logger.debug(f"Layer to shards mapping: {layer_to_shards}")
+        logger.debug(f"Shard to layers mapping: {shard_to_layers}")
 
         sorted_shards = sorted(list(set(index.values())))
         processed_shards = set()
@@ -276,10 +286,11 @@ def split_and_save_layers(
 
         with tqdm(total=total_layers, desc="Assembling layers sequentially") as pbar:
             for shard_idx, shard_file in enumerate(sorted_shards, 1):
-                logger.info("Loading shard %s/%s: %s", shard_idx, len(sorted_shards), shard_file)
+                logger.debug(f"Loading shard {shard_idx}/{len(sorted_shards)}: {shard_file}")
                 to_load = checkpoint_path / shard_file
                 if not os.path.exists(to_load):
                     assert repo_id is not None
+                    logger.debug(f"Shard {shard_file} not found locally, downloading...")
                     huggingface_hub.snapshot_download(
                         repo_id, allow_patterns=os.path.basename(to_load), token=_token
                     )
@@ -289,6 +300,7 @@ def split_and_save_layers(
                 else:
                     shard_state_dict = load_file(to_load, device="cpu")
 
+                # Collect keys from this shard
                 for k, v in shard_state_dict.items():
                     matched_layer = None
                     for layer in layers:
@@ -299,25 +311,24 @@ def split_and_save_layers(
                         if matched_layer not in partial_layers:
                             partial_layers[matched_layer] = {}
                         partial_layers[matched_layer][k] = v
+                    # else: ignore (should not happen because we built mapping from index)
 
                 del shard_state_dict
                 
-                # Check if this shard had NO matched layers whatsoever (meaning all its keys were discarded)
+                # Check if this shard had NO matched layers whatsoever (all keys discarded)
+                # This can happen if the index says a shard contains a key, but that key's layer prefix is not in our 'layers' list.
                 if delete_original and (shard_file not in shard_to_layers or len(shard_to_layers[shard_file]) == 0):
                     to_delete = checkpoint_path / shard_file
                     if os.path.exists(to_delete):
-                        logger.info("Deleted shard correctly (no target layers): %s", to_delete)
+                        logger.debug(f"Deleting shard (no target layers at all): {to_delete}")
                         remove_real_and_linked_file(to_delete)
                     if shard_file in shard_to_layers:
                         del shard_to_layers[shard_file]
                 
-                # We process incoming shards and delete them when NO MORE layers of that shard are expected to be processed.
-                # However, since `partial_layers` hasn't compressed yet, we cannot delete here! We just add to processed.
                 processed_shards.add(shard_file)
 
                 completed_layers = []
-                # We must check ALL layers that have finished their shards, not just the ones with data!
-                # If a layer has no data but all its shards are processed, it's effectively "completed" (zero keys loaded).
+                # Find all layers whose required shards are fully processed
                 for layer, required_shards in layer_to_shards.items():
                     if required_shards.issubset(processed_shards):
                         completed_layers.append(layer)
@@ -327,26 +338,33 @@ def split_and_save_layers(
                     # Remove it from layer_to_shards so we don't process it again
                     del layer_to_shards[layer]
                     
+                    logger.debug(f"Layer {layer} is now complete. Required shards: {shards_for_this_layer}")
+                    
                     if layer in partial_layers:
                         layer_state_dict = partial_layers.pop(layer)
                         layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
                         marker_exists = ModelPersister.get_model_persister().model_persist_exist(layer, saving_path)
                         if not marker_exists:
+                            logger.debug(f"Persisting layer {layer}")
                             ModelPersister.get_model_persister().persist_model(layer_state_dict, layer, saving_path)
                         del layer_state_dict
                         pbar.update(1)
                     else:
-                        # Layer had no keys after all its shards were processed. Still update pbar.
+                        # Layer had no keys after all its shards were processed. This could happen if the layer prefix matched but no actual keys were collected (unlikely).
+                        logger.warning(f"Layer {layer} was completed but had no state dict keys!")
                         pbar.update(1)
 
                     if delete_original:
+                        # After saving the layer, try to delete any shard that now has no remaining layers
                         for s_file in shards_for_this_layer:
                             if s_file in shard_to_layers and layer in shard_to_layers[s_file]:
                                 shard_to_layers[s_file].remove(layer)
-                                if len(shard_to_layers[s_file]) == 0:
+                                remaining = shard_to_layers[s_file]
+                                logger.debug(f"Shard {s_file} now has remaining layers: {remaining}")
+                                if len(remaining) == 0:
                                     to_delete = checkpoint_path / s_file
                                     if os.path.exists(to_delete):
-                                        logger.info("Deleted shard correctly after processing its layers: %s", to_delete)
+                                        logger.debug(f"Deleting shard (all its layers processed): {to_delete}")
                                         remove_real_and_linked_file(to_delete)
                                     del shard_to_layers[s_file]
 
@@ -354,7 +372,7 @@ def split_and_save_layers(
 
         # At the end, process whatever is left in partial_layers (should be none ideally)
         for layer, layer_state_dict in list(partial_layers.items()):
-            
+            logger.debug(f"Processing leftover partial layer: {layer}")
             layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
             marker_exists = ModelPersister.get_model_persister().model_persist_exist(layer, saving_path)
             if not marker_exists:
@@ -368,29 +386,39 @@ def split_and_save_layers(
                         if len(shard_to_layers[s_file]) == 0:
                             to_delete = checkpoint_path / s_file
                             if os.path.exists(to_delete):
-                                logger.info("Deleted shard correctly after processing remaining layers: %s", to_delete)
+                                logger.debug(f"Deleting shard (all its layers processed in leftover): {to_delete}")
                                 remove_real_and_linked_file(to_delete)
                             del shard_to_layers[s_file]
                 
         partial_layers.clear()
         
-        # DEBUG: Let's see what is left behind preventing deletion
+        # DEBUG: Final check for any shards that still have layers recorded
         if delete_original:
             for s_file, remaining_layers in list(shard_to_layers.items()):
                 if len(remaining_layers) > 0:
                     logger.warning(f"DEBUG: Shard {s_file} still has {len(remaining_layers)} layers preventing its deletion! Sample: {list(remaining_layers)}")
         
+        # Force delete any remaining shards if they exist (should be zero if mapping was correct)
         if delete_original:
             for s_file in list(shard_to_layers.keys()):
                 to_delete = checkpoint_path / s_file
                 if os.path.exists(to_delete):
-                    logger.info("Deleted remaining shard automatically at end: %s", to_delete)
+                    logger.info(f"Deleting remaining shard at end: {to_delete}")
                     remove_real_and_linked_file(to_delete)
                 del shard_to_layers[s_file]
+        
+        # Also scan directory for any leftover shard files that weren't in shard_to_layers (e.g., if mapping was incomplete)
+        if delete_original:
+            remaining_files = list(Path(checkpoint_path).glob("*.safetensors")) + list(Path(checkpoint_path).glob("*.bin"))
+            if remaining_files:
+                logger.warning(f"After processing, some shard files still exist: {[f.name for f in remaining_files]}")
+            else:
+                logger.info("All shard files have been deleted.")
                 
         clean_memory()
 
     else:
+        # Original non‑sequential branch (unchanged)
         for layer in tqdm(layers):
             if not single_file_model:
                 shards = [
