@@ -6,6 +6,7 @@ import os
 import time
 import gc
 import shutil
+import tempfile
 from glob import glob
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
@@ -26,10 +27,11 @@ from .memory import NotEnoughSpaceException, clean_memory
 logger = logging.getLogger(__name__)
 
 
-def force_filesystem_sync():
+def force_filesystem_sync(extra_aggressive: bool = False):
     """
     Force filesystem sync and garbage collection to ensure disk usage stats are updated.
-    This helps the Kaggle monitor reflect freed space more quickly.
+    If extra_aggressive=True, attempts to drop kernel caches (may fail without root).
+    Also writes and deletes a temporary file to try to force a kernel cache flush.
     """
     # Flush filesystem buffers (Linux)
     os.system("sync")
@@ -38,6 +40,26 @@ def force_filesystem_sync():
     # Clear CUDA cache if available
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    if extra_aggressive:
+        # Attempt to drop kernel caches (requires root; usually fails, but we try)
+        try:
+            with open('/proc/sys/vm/drop_caches', 'w') as f:
+                f.write('3')
+            tqdm.write("  Dropped kernel caches (pagecache, dentries, inodes).")
+        except Exception as e:
+            tqdm.write(f"  Could not drop kernel caches (normal, not root): {e}")
+
+        # Write and delete a temporary file in the current directory to nudge the filesystem
+        try:
+            with tempfile.NamedTemporaryFile(dir=os.getcwd(), delete=True) as tmp:
+                tmp.write(b'0' * 1024 * 1024 * 100)  # 100 MB
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            tqdm.write("  Wrote and deleted temporary file to flush caches.")
+        except Exception as e:
+            tqdm.write(f"  Temporary file trick failed: {e}")
+
     # Small delay to allow system to update
     time.sleep(0.5)
 
@@ -93,8 +115,8 @@ def remove_safe(path: Path) -> None:
         except OSError:
             pass
 
-    # Force filesystem sync after deletion
-    force_filesystem_sync()
+    # Force filesystem sync after deletion (normal sync)
+    force_filesystem_sync(extra_aggressive=False)
 
 
 def cleanup_orphaned_blobs(cache_root: Path) -> None:
@@ -120,7 +142,7 @@ def cleanup_orphaned_blobs(cache_root: Path) -> None:
 
     if removed > 0:
         tqdm.write(f"Cleaned up {removed} orphaned blobs, freed {freed / 1024**3:.2f} GB")
-        force_filesystem_sync()
+        force_filesystem_sync(extra_aggressive=False)
 
 
 def log_disk_usage(cache_root: Path, checkpoint_path: Path, saving_path: Path) -> None:
@@ -129,7 +151,7 @@ def log_disk_usage(cache_root: Path, checkpoint_path: Path, saving_path: Path) -
     Called after each shard deletion.
     """
     # Ensure filesystem is synced before reading stats
-    force_filesystem_sync()
+    force_filesystem_sync(extra_aggressive=False)
 
     blob_dir = cache_root / "blobs"
     blob_size = 0
@@ -556,15 +578,18 @@ def split_and_save_layers(
             if checkpoint_path.exists():
                 shutil.rmtree(checkpoint_path)
                 tqdm.write(f"Deleted entire snapshot directory: {checkpoint_path}")
-                force_filesystem_sync()
+                # Aggressive sync + cache drop after big deletion
+                force_filesystem_sync(extra_aggressive=True)
             # Clean up orphaned blobs globally
             hub_root = checkpoint_path.parent.parent.parent
             cleanup_orphaned_blobs(hub_root)
             tqdm.write("Extreme cleanup completed.")
+            # Final aggressive sync
+            force_filesystem_sync(extra_aggressive=True)
 
         # Final disk usage summary
         hub_root = checkpoint_path.parent.parent.parent
-        force_filesystem_sync()  # Ensure latest stats
+        force_filesystem_sync(extra_aggressive=False)  # Ensure latest stats
         blob_dir = hub_root / "blobs"
         blob_size = 0
         if blob_dir.exists():
@@ -583,6 +608,7 @@ def split_and_save_layers(
             f"Blobs directory: {blob_size:.2f} GB\n"
             f"Total: {(sum(f.stat().st_size for f in final_shards) + sum(f.stat().st_size for f in final_split) + (sum(f.stat().st_size for f in blob_dir.glob('*') if f.is_file()) if blob_dir.exists() else 0)) / 1024**3:.2f} GB"
         )
+        tqdm.write("Note: Kaggle's disk monitor may lag; use `!df -h /kaggle` for real usage.")
 
         clean_memory()
 
