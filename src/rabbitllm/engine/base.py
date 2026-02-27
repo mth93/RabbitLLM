@@ -173,6 +173,15 @@ class RabbitLLMBaseModel(GenerationMixin):
                 NOT performed — oldest entries stay).  Set to the number of layers that fit
                 in your available RAM budget (e.g. 30 for a 32 GB machine with 4-bit weights).
                 Pass ``None`` (default) to disable caching.
+            sequential_shard_processing: If True, process shards one by one, compressing each
+                layer immediately and deleting original shards as soon as they are no longer
+                needed. This reduces peak disk usage significantly.
+            extreme_disk_cleanup: If True, after successful splitting and saving of all layers,
+                the original snapshot directory and all other snapshots of the same model are
+                permanently deleted. Orphaned blobs are also removed. This frees maximum disk
+                space, leaving only the compressed per‑layer files required for inference.
+                Use with caution – the original model files cannot be recovered without
+                re‑downloading.
         """
 
         self.profiling_mode = profiling_mode
