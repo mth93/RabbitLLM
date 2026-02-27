@@ -33,11 +33,8 @@ def force_filesystem_sync(extra_aggressive: bool = False):
     If extra_aggressive=True, attempts to drop kernel caches (may fail without root).
     Also writes and deletes a temporary file to try to force a kernel cache flush.
     """
-    # Flush filesystem buffers (Linux)
     os.system("sync")
-    # Force Python garbage collection
     gc.collect()
-    # Clear CUDA cache if available
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -60,7 +57,6 @@ def force_filesystem_sync(extra_aggressive: bool = False):
         except Exception as e:
             tqdm.write(f"  Temporary file trick failed: {e}")
 
-    # Small delay to allow system to update
     time.sleep(0.5)
 
 
@@ -73,24 +69,18 @@ def remove_safe(path: Path) -> None:
     if not path.exists():
         return
 
-    # Locate the blob directory (HF cache structure)
-    # path is like .../hub/models--repo--id/snapshots/hash/filename
-    # blob directory is at .../hub/blobs
     hub_root = path.parent.parent.parent
     blob_dir = hub_root / "blobs"
     blob_file = None
 
-    # Get inode of the snapshot file
     try:
         stat_before = path.stat()
         inode = stat_before.st_ino
     except OSError:
-        # If we can't stat, just delete the file
         path.unlink()
         tqdm.write(f"  Removed {path.name} (could not stat, blob not tracked)")
         return
 
-    # Find the corresponding blob file (if any) by inode
     if blob_dir.exists():
         for f in blob_dir.iterdir():
             if f.is_file():
@@ -101,21 +91,17 @@ def remove_safe(path: Path) -> None:
                 except OSError:
                     continue
 
-    # Now delete the snapshot file
     path.unlink()
     tqdm.write(f"  Deleted snapshot file: {path.name}")
 
-    # If we found a blob file, check its link count after deletion
     if blob_file is not None and blob_file.exists():
         try:
-            # After deleting the snapshot, the blob's link count should be 1 if no other snapshots reference it
             if blob_file.stat().st_nlink == 1:
                 blob_file.unlink()
                 tqdm.write(f"  Deleted orphaned blob: {blob_file.name}")
         except OSError:
             pass
 
-    # Force filesystem sync after deletion (normal sync)
     force_filesystem_sync(extra_aggressive=False)
 
 
@@ -145,12 +131,34 @@ def cleanup_orphaned_blobs(cache_root: Path) -> None:
         force_filesystem_sync(extra_aggressive=False)
 
 
+def cleanup_other_snapshots(model_dir: Path, keep_snapshot: Path) -> None:
+    """
+    Delete all snapshots in the model directory except the one we are keeping.
+    This frees space from previous runs.
+    """
+    snapshots_dir = model_dir / "snapshots"
+    if not snapshots_dir.exists():
+        return
+
+    deleted_any = False
+    for snap in snapshots_dir.iterdir():
+        if snap.is_dir() and snap != keep_snapshot:
+            try:
+                shutil.rmtree(snap)
+                tqdm.write(f"  Deleted old snapshot: {snap.name}")
+                deleted_any = True
+            except Exception as e:
+                tqdm.write(f"  Failed to delete {snap.name}: {e}")
+
+    if deleted_any:
+        force_filesystem_sync(extra_aggressive=False)
+
+
 def log_disk_usage(cache_root: Path, checkpoint_path: Path, saving_path: Path) -> None:
     """
     Log current disk usage: blob directory size and total HF cache size.
     Called after each shard deletion.
     """
-    # Ensure filesystem is synced before reading stats
     force_filesystem_sync(extra_aggressive=False)
 
     blob_dir = cache_root / "blobs"
@@ -158,19 +166,16 @@ def log_disk_usage(cache_root: Path, checkpoint_path: Path, saving_path: Path) -
     if blob_dir.exists():
         blob_size = sum(f.stat().st_size for f in blob_dir.glob("*") if f.is_file()) / 1024**3
 
-    # Also compute total cache size (hub directory)
     cache_size = 0
     if cache_root.exists():
         cache_size = sum(f.stat().st_size for f in cache_root.rglob("*") if f.is_file()) / 1024**3
 
-    # Remaining shards in snapshot
     remaining_shards = list(Path(checkpoint_path).glob("*.safetensors")) + list(
         Path(checkpoint_path).glob("*.bin")
     )
     shard_count = len(remaining_shards)
     shard_size = sum(f.stat().st_size for f in remaining_shards) / 1024**3
 
-    # Split layers size
     split_files = list(saving_path.glob("*.safetensors"))
     split_size = sum(f.stat().st_size for f in split_files) / 1024**3
 
@@ -430,7 +435,6 @@ def split_and_save_layers(
                     to_delete = checkpoint_path / shard_file
                     if os.path.exists(to_delete):
                         remove_safe(to_delete)
-                        # After deletion, log disk usage
                         hub_root = checkpoint_path.parent.parent.parent
                         log_disk_usage(hub_root, checkpoint_path, saving_path)
                     if shard_file in shard_to_layers:
@@ -452,13 +456,11 @@ def split_and_save_layers(
                     if layer in partial_layers:
                         layer_state_dict = partial_layers.pop(layer)
 
-                        # --- Calculate uncompressed size ---
                         uncompressed_bytes = sum(
                             v.numel() * v.element_size() for v in layer_state_dict.values()
                         )
                         uncompressed_gb = uncompressed_bytes / 1024**3
 
-                        # --- Compress and save ---
                         layer_state_dict = compress_layer_state_dict(layer_state_dict, compression)
                         marker_exists = ModelPersister.get_model_persister().model_persist_exist(
                             layer, saving_path
@@ -468,7 +470,6 @@ def split_and_save_layers(
                                 layer_state_dict, layer, saving_path
                             )
 
-                        # --- Get saved file size ---
                         layer_filename = layer.rstrip('.') + ".safetensors"
                         layer_file = saving_path / layer_filename
                         if layer_file.exists():
@@ -499,14 +500,13 @@ def split_and_save_layers(
                                     to_delete = checkpoint_path / s_file
                                     if os.path.exists(to_delete):
                                         remove_safe(to_delete)
-                                        # After deletion, log disk usage
                                         hub_root = checkpoint_path.parent.parent.parent
                                         log_disk_usage(hub_root, checkpoint_path, saving_path)
                                     del shard_to_layers[s_file]
 
                 clean_memory()
 
-        # At the end, process leftovers (if any)
+        # Process leftovers
         for layer, layer_state_dict in list(partial_layers.items()):
             tqdm.write(f"Processing leftover partial layer: {layer}")
             uncompressed_bytes = sum(v.numel() * v.element_size() for v in layer_state_dict.values())
@@ -574,22 +574,26 @@ def split_and_save_layers(
         # --- Extreme disk cleanup ---
         if extreme_disk_cleanup:
             tqdm.write("===== EXTREME DISK CLEANUP ACTIVATED =====")
-            # Delete the entire snapshot directory (original model files)
+
+            # First, delete all other snapshots for this model
+            model_dir = checkpoint_path.parent.parent  # e.g., .../models--Qwen--Qwen3-Coder-Next
+            cleanup_other_snapshots(model_dir, checkpoint_path)
+
+            # Then delete the current snapshot directory (original model files)
             if checkpoint_path.exists():
                 shutil.rmtree(checkpoint_path)
-                tqdm.write(f"Deleted entire snapshot directory: {checkpoint_path}")
-                # Aggressive sync + cache drop after big deletion
+                tqdm.write(f"Deleted current snapshot directory: {checkpoint_path}")
                 force_filesystem_sync(extra_aggressive=True)
+
             # Clean up orphaned blobs globally
             hub_root = checkpoint_path.parent.parent.parent
             cleanup_orphaned_blobs(hub_root)
             tqdm.write("Extreme cleanup completed.")
-            # Final aggressive sync
             force_filesystem_sync(extra_aggressive=True)
 
         # Final disk usage summary
         hub_root = checkpoint_path.parent.parent.parent
-        force_filesystem_sync(extra_aggressive=False)  # Ensure latest stats
+        force_filesystem_sync(extra_aggressive=False)
         blob_dir = hub_root / "blobs"
         blob_size = 0
         if blob_dir.exists():
