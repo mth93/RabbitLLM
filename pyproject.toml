@@ -16,7 +16,8 @@ requires-python = ">=3.10"
 dependencies = [
     "tqdm",
     "torch>=2.5,<2.6",
-    "transformers>=5.0,<5.3",
+    # Qwen3MoeForCausalLM requires transformers 4.51.1 (or <5.0)
+    "transformers==4.51.1",
     "accelerate>=1.1.0",
     "safetensors>=0.4",
     "huggingface-hub>=0.20",
@@ -35,14 +36,14 @@ classifiers = [
 
 [project.optional-dependencies]
 compression = ["bitsandbytes"]
-flash = ["flash-attn>=2.5"]
+# flash-attn >=2.7 provides wheels compatible with torch 2.5.x
+flash = ["flash-attn>=2.7,<2.8"]
 server = []
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rabbitllm"]
 include = ["src/rabbitllm/**"]
 
-# flash-attn needs torch at build time when built from source (no prebuilt wheel)
 [tool.uv.extra-build-dependencies]
 flash-attn = ["torch"]
 
