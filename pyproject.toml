@@ -9,15 +9,15 @@ description = "Run 70B+ LLMs on a single 4GB GPU — no quantization required. L
 readme = "README.md"
 license = "MIT"
 authors = [
-    { name = "Mohamed Hammad", email = "mohamedhammad89@gmail.com" }  # Email placeholder – update as needed
+    { name = "Mohamed Hammad", email = "mohamedhammad89@gmail.com" }  # Update with your email
 ]
-urls = { Homepage = "https://github.com/ManuelSLemos/RabbitLLM" }
+urls = { Homepage = "https://github.com/mth93/RabbitLLM" }
 requires-python = ">=3.10"
 dependencies = [
     "tqdm",
     "torch>=2.5,<2.6",
-    # Qwen3MoeForCausalLM requires transformers 4.51.1 exactly
-    "transformers==4.51.1",
+    "torchvision>=0.20,<0.21",          # Pinned to 0.20.x for compatibility with torch 2.5
+    "transformers==4.51.1",              # Kept as required for Qwen3Moe
     "accelerate>=1.1.0",
     "safetensors>=0.4",
     "huggingface-hub>=0.20",
@@ -36,14 +36,7 @@ classifiers = [
 
 [project.optional-dependencies]
 compression = ["bitsandbytes"]
-# ⚠️  FLASH ATTENTION WARNING ⚠️
-# Do NOT install this extra directly in cloud notebooks or environments
-# without a pre‑compiled wheel. Pip will attempt to build from source,
-# which can hang for 15+ minutes. Instead:
-#   1. Install a matching wheel manually from:
-#      https://github.com/Dao-AILab/flash-attention/releases/tag/v2.7.0
-#   2. Then install RabbitLLM without the [flash] extra (flash-attn is already present).
-# If you don't need FlashAttention, simply omit this extra entirely.
+# Flash Attention – optional; installation may require manual wheel matching your CUDA.
 flash = ["flash-attn>=2.7,<2.8"]
 server = []
 
