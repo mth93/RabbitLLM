@@ -36,9 +36,14 @@ classifiers = [
 
 [project.optional-dependencies]
 compression = ["bitsandbytes"]
-# ⚠️  WARNING: Do NOT install this extra directly if you are in a cloud notebook.
-# Instead, first install flash-attn from a pre‑compiled wheel matching your PyTorch and CUDA.
-# See instructions below. After that, you can install RabbitLLM without the [flash] extra.
+# ⚠️  FLASH ATTENTION WARNING ⚠️
+# Do NOT install this extra directly in cloud notebooks or environments
+# without a pre‑compiled wheel. Pip will attempt to build from source,
+# which can hang for 15+ minutes. Instead:
+#   1. Install a matching wheel manually from:
+#      https://github.com/Dao-AILab/flash-attention/releases/tag/v2.7.0
+#   2. Then install RabbitLLM without the [flash] extra (flash-attn is already present).
+# If you don't need FlashAttention, simply omit this extra entirely.
 flash = ["flash-attn>=2.7,<2.8"]
 server = []
 
