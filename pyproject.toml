@@ -16,7 +16,7 @@ requires-python = ">=3.10"
 dependencies = [
     "tqdm",
     "torch>=2.5,<2.6",
-    # Qwen3MoeForCausalLM requires transformers 4.51.1 (or <5.0)
+    # Qwen3MoeForCausalLM requires transformers 4.51.1 exactly
     "transformers==4.51.1",
     "accelerate>=1.1.0",
     "safetensors>=0.4",
@@ -36,7 +36,9 @@ classifiers = [
 
 [project.optional-dependencies]
 compression = ["bitsandbytes"]
-# flash-attn >=2.7 provides wheels compatible with torch 2.5.x
+# ⚠️  WARNING: Do NOT install this extra directly if you are in a cloud notebook.
+# Instead, first install flash-attn from a pre‑compiled wheel matching your PyTorch and CUDA.
+# See instructions below. After that, you can install RabbitLLM without the [flash] extra.
 flash = ["flash-attn>=2.7,<2.8"]
 server = []
 
