@@ -9,7 +9,7 @@ description = "Run 70B+ LLMs on a single 4GB GPU — no quantization required. L
 readme = "README.md"
 license = "MIT"
 authors = [
-    { name = "Manuel S. Lemos", email = "im@manuelslemos.es" }
+    { name = "Mohamed Hammad", email = "mohamedhammad89@gmail.com" }  # Email placeholder – update as needed
 ]
 urls = { Homepage = "https://github.com/ManuelSLemos/RabbitLLM" }
 requires-python = ">=3.10"
